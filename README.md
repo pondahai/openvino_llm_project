@@ -67,6 +67,28 @@ for chunk in response:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
+### 4. (推薦) 使用 OpenVINO Model Server (OVMS) 作為後端
+OVMS 支援 **prefix caching**：多輪對話不需重新預填充整段歷史 (實測 2639 tokens 長文第 2 輪由約 250 秒降到 5 秒)，並內建工具呼叫解析。
+
+1. 下載 OVMS Windows 套件 (weekly 版，正式版 2026.3.1 無法載入本模型的 main 版本)：
+   `https://storage.openvinotoolkit.org/repositories/openvino_model_server/packages/weekly/latest/`
+2. 解壓後以 `-OvmsDir` 或環境變數 `OVMS_DIR` 指定 `ovms` 資料夾，雙擊 `run_ovms.bat` 或執行：
+```powershell
+.\start_ovms.ps1 -OvmsDir C:\path	o\ovms
+```
+3. API 位址為 `http://127.0.0.1:8000/v3`，模型名稱 `qwen3.8-27b-ovms`；GUI 側邊欄可切換後端。
+4. 關閉思考模式時請在請求加上 `stop: ["</think>"]` (模型偶爾在回答後輸出 `</think>` 並重複回答)：
+```python
+client = OpenAI(base_url="http://127.0.0.1:8000/v3", api_key="not-needed")
+client.chat.completions.create(
+    model="qwen3.8-27b-ovms",
+    messages=[{"role": "user", "content": "你好！"}],
+    stop=["</think>"],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+```
+詳細評估與實測數據見 `docs/Intel_IrisXe_OpenVINO_Notes.md` 第十節。
+
 ---
 
 ## 📂 專案結構
@@ -83,6 +105,8 @@ openvino_llm_project/
 ├── requirements.txt           # 專案套件依賴清單
 ├── run_gui.bat                # 一鍵啟動 GUI 對話介面批次檔
 ├── run_api_server.bat         # 一鍵啟動 API 伺服器批次檔
+├── run_ovms.bat               # 一鍵啟動 OVMS 批次檔
+├── start_ovms.ps1             # OVMS 啟動參數 (VLM_CB / GPU / prefix caching)
 ├── .gitignore                 # Git 忽略設定 (排除巨大權重與快取)
 └── docs/                      # 開發筆記、理論推導與測試報告
     ├── Intel_IrisXe_OpenVINO_Notes.md    # 核心硬體規格與頻寬理論推導筆記

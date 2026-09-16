@@ -14,35 +14,54 @@ st.set_page_config(
 )
 
 st.title("⚡ Intel Iris Xe OpenVINO 對話介面 (Client 模式)")
-st.caption("前端：Streamlit Client | 後端：OpenVINO API Server (Port 1234) | 硬體：Intel Iris Xe Graphics (80 EUs) + 64GB RAM")
+st.caption("前端：Streamlit Client | 後端：自製 OpenVINO Server 或 OVMS | 硬體：Intel Iris Xe Graphics (80 EUs) + 64GB RAM")
 
-API_BASE_URL = "http://127.0.0.1:1234/v1"
-MODEL_NAME = "qwen3.8-27b-int4-ov"
+# 可選後端：自製 OpenVINO 伺服器 或 OpenVINO Model Server (OVMS)
+BACKENDS = {
+    "自製 OpenVINO Server (Port 1234)": {
+        "base_url": "http://127.0.0.1:1234/v1",
+        "model": "qwen3.8-27b-int4-ov",
+        "launcher": "run_api_server.bat",
+    },
+    "OpenVINO Model Server (Port 8000)": {
+        "base_url": "http://127.0.0.1:8000/v3",
+        "model": "qwen3.8-27b-ovms",
+        "launcher": "run_ovms.bat",
+    },
+}
 
-# 初始化 OpenAI 客戶端 (連線本地 OpenVINO 伺服器)
+# 初始化 OpenAI 客戶端 (依後端快取)
 @st.cache_resource
-def get_client():
-    return OpenAI(base_url=API_BASE_URL, api_key="not-needed")
-
-client = get_client()
+def get_client(base_url: str):
+    return OpenAI(base_url=base_url, api_key="not-needed")
 
 # 側邊欄控制
 with st.sidebar:
     st.header("⚙️ 伺服器與模型設置")
-    
+
+    backend_name = st.radio(
+        "後端伺服器",
+        list(BACKENDS.keys()),
+        help="OVMS 支援 prefix caching，多輪對話不需重新預填充整段歷史，速度快很多"
+    )
+    backend = BACKENDS[backend_name]
+    is_ovms = backend["base_url"].endswith("/v3")
+    client = get_client(backend["base_url"])
+    MODEL_NAME = backend["model"]
+
     # 檢查後端伺服器連線狀態
     server_online = False
     try:
         models = client.models.list()
         server_online = True
-        st.success(f"🟢 後端伺服器連線正常 (Port 1234)\n模型: {models.data[0].id}")
+        st.success(f"🟢 後端伺服器連線正常\n模型: {models.data[0].id}")
     except Exception as e:
-        st.error(f"🔴 無法連線至後端伺服器 (http://127.0.0.1:1234/v1)\n請先執行 `run_api_server.bat` 啟動伺服器！")
-        
+        st.error(f"🔴 無法連線至後端伺服器 ({backend['base_url']})\n請先執行 `{backend['launcher']}` 啟動伺服器！")
+
     st.info("💻 運算設備：Intel Iris Xe (已配置 Priority.LOW 保護螢幕不閃爍)")
-    
+
     max_tokens = st.slider("最大輸出長度 (Max Tokens)", 64, 4096, 512, step=64)
-    history_turns = st.slider("歷史對話保留輪數", 1, 50, 10, step=1, help="送入伺服器的對話輪數；伺服器會依 16k 上下文自動裁剪最舊訊息並分段預填充。歷史越長首字延遲越久 (約 10 tokens/s)")
+    history_turns = st.slider("歷史對話保留輪數", 1, 50, 10, step=1, help="送入伺服器的對話輪數；上下文上限約 16k。自製伺服器每輪都重新預填充 (約 10 tokens/s)，OVMS 有 prefix caching 只需處理新訊息")
     temperature = st.slider("溫度 (Temperature)", 0.0, 1.5, 0.7, step=0.1)
     top_p = st.slider("Top P", 0.1, 1.0, 0.9, step=0.05)
     enable_thinking = st.checkbox("啟用深層思考 (<think> 模式)", value=False)
@@ -51,7 +70,7 @@ with st.sidebar:
         value="你是由阿里巴巴開發的 Qwen 人工智慧助手。請一律使用繁體中文，友善、準確、清晰地回答使用者的問題。",
         height=90
     )
-    
+
     st.markdown("---")
     st.markdown("""
     **前後端分離優勢：**
@@ -60,7 +79,7 @@ with st.sidebar:
     * 標準 OpenAI API 串流通訊
     * GPU 優先級自動調節，保護桌面流暢
     """)
-    
+
     if st.button("🧹 清空對話記錄"):
         st.session_state.messages = []
         st.rerun()
@@ -77,7 +96,7 @@ for msg in st.session_state.messages:
 # 處理用戶輸入
 if user_prompt := st.chat_input("請輸入訊息，透過 OpenVINO Server 開始對話..."):
     if not server_online:
-        st.error("伺服器未連線，請先啟動 `run_api_server.bat`！")
+        st.error(f"伺服器未連線，請先啟動 `{backend['launcher']}`！")
         st.stop()
 
     st.session_state.messages.append({"role": "user", "content": user_prompt})
@@ -87,7 +106,7 @@ if user_prompt := st.chat_input("請輸入訊息，透過 OpenVINO Server 開始
     with st.chat_message("assistant"):
         status_box = st.empty()
         status_box.info("⚡ 透過 OpenAI API 串流要求 OpenVINO Server 生成中...")
-        
+
         try:
             # 嚴格只取有效對話歷史（排除之前的系統錯誤訊息），並截取最近 N 輪
             valid_history = [
@@ -95,15 +114,23 @@ if user_prompt := st.chat_input("請輸入訊息，透過 OpenVINO Server 開始
                 if not m["content"].startswith("[系統錯誤")
             ]
             recent_msgs = valid_history[-(history_turns * 2):]
-            
+
             req_messages = [{"role": "system", "content": system_prompt}]
             for m in recent_msgs:
                 req_messages.append({"role": m["role"], "content": m["content"]})
             req_messages.append({"role": "user", "content": user_prompt})
-            
+
             start_t = time.time()
             metrics = {"first_token_time": None, "count": 0}
-            
+
+            if is_ovms:
+                # OVMS 以 chat_template_kwargs 控制思考模式；關閉思考時模型偶爾在回答後輸出 </think> 並重複回答，由客戶端停止
+                request_options = {"extra_body": {"chat_template_kwargs": {"enable_thinking": enable_thinking}}}
+                if not enable_thinking:
+                    request_options["stop"] = ["</think>"]
+            else:
+                request_options = {"extra_body": {"enable_thinking": enable_thinking}}
+
             response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=req_messages,
@@ -111,9 +138,9 @@ if user_prompt := st.chat_input("請輸入訊息，透過 OpenVINO Server 開始
                 temperature=temperature,
                 top_p=top_p,
                 stream=True,
-                extra_body={"enable_thinking": enable_thinking}
+                **request_options
             )
-            
+
             status_box.empty()
 
             def sse_stream_generator():
@@ -126,15 +153,15 @@ if user_prompt := st.chat_input("請輸入訊息，透過 OpenVINO Server 開始
                         yield content
 
             final_content = st.write_stream(sse_stream_generator())
-            
+
             elapsed = time.time() - start_t
             ttft = metrics["first_token_time"] - start_t if metrics["first_token_time"] else 0
             gen_time = elapsed - ttft
             tps = metrics["count"] / gen_time if gen_time > 0 else 0
-            
-            st.caption(f"⚡ 首字延遲 (TTFT): {ttft:.2f}s | 純生成耗時: {gen_time:.2f}s | 速度: {tps:.2f} tokens/s | 架構: Client -> OpenAI API Server -> Iris Xe")
+
+            st.caption(f"⚡ 首字延遲 (TTFT): {ttft:.2f}s | 純生成耗時: {gen_time:.2f}s | 速度: {tps:.2f} tokens/s | 架構: Client -> {backend_name} -> Iris Xe")
             st.session_state.messages.append({"role": "assistant", "content": final_content})
-            
+
         except Exception as e:
             status_box.empty()
             st.error(f"❌ 伺服器通訊錯誤: {str(e)}")
