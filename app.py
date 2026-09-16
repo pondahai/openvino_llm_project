@@ -41,8 +41,8 @@ with st.sidebar:
         
     st.info("💻 運算設備：Intel Iris Xe (已配置 Priority.LOW 保護螢幕不閃爍)")
     
-    max_tokens = st.slider("最大輸出長度 (Max Tokens)", 64, 384, 160, step=32)
-    history_turns = st.slider("歷史對話保留輪數", 1, 5, 2, step=1, help="限制送入 GPU 的對話輪數，避免超長歷史導致內顯 TDR 驅動重置或顯存超限")
+    max_tokens = st.slider("最大輸出長度 (Max Tokens)", 64, 4096, 512, step=64)
+    history_turns = st.slider("歷史對話保留輪數", 1, 50, 10, step=1, help="送入伺服器的對話輪數；伺服器會依 16k 上下文自動裁剪最舊訊息並分段預填充。歷史越長首字延遲越久 (約 10 tokens/s)")
     temperature = st.slider("溫度 (Temperature)", 0.0, 1.5, 0.7, step=0.1)
     top_p = st.slider("Top P", 0.1, 1.0, 0.9, step=0.05)
     enable_thinking = st.checkbox("啟用深層思考 (<think> 模式)", value=False)

@@ -181,9 +181,50 @@ OpenVINO 內建 GGUF Reader 目前對新型多模態架構與新式量化格式�
   若不修改系統註冊表，伺服器端實施嚴格的防禦性計算控制：
   1. **異構運算分工 (Heterogeneous Offload)**：
      將文字嵌入層 (`openvino_text_embeddings_model.xml`) 改由 **CPU** 編譯執行，避開雙 GPU 模型在同一個 OpenCL Context 競爭顯存與佇列。
-  2. **滑動視窗歷史 (Sliding Window)**：
+  2. **滑動視窗歷史 (Sliding Window)**：*(已由第九節「依 token 數裁剪訊息」取代)*
      在 `openai_server.py` 的 `render_prompt` 中，對話歷史採取只保留最近 1~2 則訊息，防止 Prefill 累積過長。
-  3. **提示詞 Token 硬性截斷 (Prompt Clipping)**：
+  3. **提示詞 Token 硬性截斷 (Prompt Clipping)**：*(已由第九節「分段預填充」取代，不再丟棄 system / tools)*
      若輸入超過 200 Tokens，自動截取最後 200 Tokens，確保單次 Prefill 在 1.5 秒內完成，永遠不碰觸 Windows 2 秒 TDR 殺線。
   4. **GPU 隊列優先級降級**：
      配置 `"GPU_QUEUE_THROTTLE": "LOW"`, `"GPU_QUEUE_PRIORITY": "LOW"`, `"MODEL_PRIORITY": "LOW"`，優先讓出主頻與匯流排給桌面渲染。
+
+---
+
+## 🧱 九、本機硬體極限分析與 16k 上下文實作 (2026-09-16)
+
+### 1. 硬體極限一覽
+| 限制 | 數值 | 說明 |
+|---|---|---|
+| GPU 共享記憶體池 (`GPU_DEVICE_TOTAL_MEM_SIZE`) | **29.5 GB** | 約系統 RAM 的一半，由驅動決定，無法調高；權重與 KV Cache 都在此池 |
+| 單一 Buffer 上限 | 4 GB | 已透過 `GPU_ENABLE_LARGE_ALLOCATIONS` 解除 |
+| Windows TDR | **2 秒** | 單次 GPU 推論超過即驅動重設 (`-14`)，決定單次 Prefill 長度上限，是最主要的瓶頸 |
+| 記憶體頻寬 | DDR4-3200 雙通道 | 決定生成速度 (約 1~2 tokens/s)，硬體層面無解 |
+
+### 2. KV Cache 容量估算 (為何 128k 不可行)
+Qwen3.8-27B 共 64 層，其中只有 **16 層 full attention** (每 4 層一層)，其餘為 linear attention (固定大小狀態，不隨長度增長)。
+
+```
+KV Cache = 16 層 × 2 (K/V) × 4 KV heads × 256 head_dim × N tokens × 2 bytes (FP16)
+         ≈ 0.123 MB / token
+```
+
+| 上下文 | KV Cache | 權重 26 GB + KV | 結論 |
+|---|---|---|---|
+| 16k | ~2.0 GB | ~28 GB | ✅ 可行 (目前設定) |
+| 32k | ~3.9 GB | ~30 GB | ⚠️ 超過 29.5 GB 池 |
+| 128k | ~15.7 GB | ~42 GB | ❌ 不可行；且 Prefill 需數小時 |
+
+### 3. 分段預填充 (Chunked Prefill)
+* `MAX_CONTEXT_TOKENS = 16384`，prompt 與生成共用 (prompt 上限 = 16384 − max_tokens)。
+* Prompt 切成每段 `PREFILL_CHUNK_TOKENS` (預設 128，可由環境變數調整) 依序送入 stateful 模型累積 KV Cache，單段遠低於 TDR 2 秒。
+* 超長時改為**以訊息為單位**從最舊對話丟棄，永遠保留 system 與 tools 定義；剩單則仍過長才截掉中段 token。
+* 全域 `asyncio.Lock` 序列化請求，推論在 threadpool 執行不阻塞事件迴圈。
+
+### 4. 實測結果
+| 測試 | Prompt | 結果 |
+|---|---|---|
+| 長文檢索 (159 條倉庫事實，問第 5 號) | 2639 tokens，21 段 | 答案 `35` 正確，**250 秒**，無 TDR |
+
+* 預填充速度約 **10.5 tokens/s** → 滿載 16k prompt 首字延遲估計約 **25 分鐘**，適合離線長文，不適合互動聊天。
+* 若要縮短首字延遲，可在修改 `TdrDelay` 後調大 `PREFILL_CHUNK_TOKENS` (減少分段開銷)。
+
