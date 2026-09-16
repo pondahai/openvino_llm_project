@@ -3,7 +3,10 @@ import sys
 import time
 import requests
 
-TOKEN = "***REMOVED***"
+# 請先設定環境變數 HF_TOKEN (Hugging Face Access Token)
+TOKEN = os.environ.get("HF_TOKEN")
+if not TOKEN:
+    sys.exit("請先設定環境變數 HF_TOKEN，例如 PowerShell: $env:HF_TOKEN = \"hf_...\"")
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
 FILES = [
