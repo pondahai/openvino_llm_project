@@ -30,7 +30,7 @@
 | **首字延遲 (TTFT)** | < 3.0 秒 | **2.58 秒** | **6.51 秒 (含網頁通訊)** |
 | **記憶體佔用 (RAM)** | 14.87 GB (基礎權重) | **26.18 GB** (含 KV Cache) | **26.50 GB** (含網頁緩衝) |
 
-> 完整理論推導過程與深度分析請參閱：[`docs/Intel_IrisXe_OpenVINO_Notes.md`](docs/Intel_IrisXe_OpenVINO_Notes.md)
+> 完整理論推導過程與深度分析請參閱：[`docs/Intel_IrisXe_OpenVINO_Notes.md`](docs/Intel_IrisXe_OpenVINO_Notes.md)，所有筆記的導覽見下方 [📚 研究筆記導覽](#-研究筆記導覽)。
 
 ---
 
@@ -87,7 +87,41 @@ client.chat.completions.create(
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
 )
 ```
-詳細評估與實測數據見 `docs/Intel_IrisXe_OpenVINO_Notes.md` 第十節。
+詳細評估與實測數據見 [研究筆記第十、十一節](docs/Intel_IrisXe_OpenVINO_Notes.md)。
+
+---
+
+## 📚 研究筆記導覽
+
+所有筆記位於 [`docs/`](docs/)，建議閱讀順序：歷程日誌 → 測試計畫 → 研究筆記。
+
+### 1. [📜 實戰完整歷程日誌](docs/Intel_IrisXe_Technical_Chronicle.md)
+從「這台筆電能不能跑大模型」出發的時間線紀錄：
+* 硬體體檢、LM Studio 與 OpenVINO 後端比較
+* 驗證「能否共用 LM Studio 的 GGUF 模型」與相容性掃描失敗原因
+* Intel AI Playground 的限制、突破下載限速、Qwen3.8-27B 首次實測
+* ChatML 對話模板演進與 OpenAI 相容 Agent Server 的誕生
+
+### 2. [🧪 推論測試計畫與首發成果](docs/Qwen3.8_27B_IrisXe_Test_Plan.md)
+* 測試目標、環境基準、指標 (TTFT / TPS / 記憶體) 與三種 Prompt 情境
+* 自動化基準測試腳本與驗收標準
+* 首發實測：峰值記憶體 26.18 GB、生成約 1.7~1.9 tokens/s
+
+### 3. [📓 完整研究筆記](docs/Intel_IrisXe_OpenVINO_Notes.md)
+專案的核心技術文件，依章節整理：
+
+| 章節 | 內容 |
+| :--- | :--- |
+| 一 ~ 三 | 硬體規格、DDR4 頻寬推導理論速度、理論 vs 三種實測模式對比 |
+| 四 ~ 六 | OpenVINO 環境偵測、GGUF 格式不相容分析、與 LM Studio 對話行為對齊 |
+| 七 | 專案展示 (前後端分離 Client 模式 / 獨立 GUI 模式) |
+| 八 | 除錯實錄：Jinja2 500 錯誤、GPU 4GB 單塊記憶體上限、OpenCL `-14` 與 TDR 螢幕閃爍 |
+| 九 | 硬體極限分析 (29.5GB GPU 記憶體池、TDR、頻寬)、KV Cache 估算 (為何 128k 不可行)、分段預填充與 16k 上下文 |
+| 十 | OpenVINO Model Server (OVMS) 評估：版本相容性、量化 bug 風險、設定對照與實測比較 |
+| 十一 | 自製伺服器 Prefix Caching 設計與實測 (多輪長文由 ~250 秒降到 5 秒) |
+
+### 4. [📄 GGUF 相容性掃描原始紀錄](docs/openvino_test_results.txt)
+掃描 LM Studio 模型資料夾 (共 13 個 GGUF 檔) 並以 OpenVINO GenAI 嘗試直接載入的原始輸出，記錄各模型失敗原因 (對應歷程日誌第四階段)。
 
 ---
 
@@ -112,6 +146,7 @@ openvino_llm_project/
     ├── Intel_IrisXe_OpenVINO_Notes.md    # 核心硬體規格與頻寬理論推導筆記
     ├── Intel_IrisXe_Technical_Chronicle.md # 完整踩坑歷程與技術紀要
     ├── Qwen3.8_27B_IrisXe_Test_Plan.md   # 測試計劃與驗收標準
+    ├── openvino_test_results.txt         # GGUF 相容性掃描原始紀錄
     └── images/
         └── gui_showcase.png              # GUI 實測開版成果截圖
 ```
