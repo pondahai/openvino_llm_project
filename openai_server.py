@@ -4,6 +4,7 @@ import time
 import json
 import uuid
 import asyncio
+import re
 from typing import List, Optional, Dict, Any, Union
 from pydantic import BaseModel, Field, AliasChoices
 from fastapi import FastAPI, Request, HTTPException
@@ -211,24 +212,88 @@ def get_v0_models(model_id: Optional[str] = None):
         "max_context_length": MAX_CONTEXT_TOKENS
     }
 
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
-    has_tools = has_tool_context(req)
-    max_steps = min(req.max_tokens or 512, MAX_CONTEXT_TOKENS // 2)
-    # prompt 與生成共用 MAX_CONTEXT_TOKENS 的 KV cache 空間
-    input_ids = build_input_ids(req, MAX_CONTEXT_TOKENS - max_steps)
+SPECIAL_TAGS = ("<|im_end|>", "<|im_start|>", "<|endoftext|>")
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\s]+)>(.*?)</function>\s*</tool_call>", re.S)
+PARAM_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.S)
 
+def decode_ids(ids: List[int]) -> str:
+    if not ids:
+        return ""
+    return str(c_detok([np.array([ids], dtype=np.int64)])["string_output"][0])
+
+class IncrementalDecoder:
+    """以視窗重新解碼新 token，避免中文 UTF-8 位元組被拆在兩個 token 時輸出 �"""
+    def __init__(self):
+        self.ids: List[int] = []
+        self.prefix_offset = 0
+        self.read_offset = 0
+
+    def add(self, token_id: int) -> str:
+        self.ids.append(token_id)
+        prefix_text = decode_ids(self.ids[self.prefix_offset:self.read_offset])
+        new_text = decode_ids(self.ids[self.prefix_offset:])
+        if new_text.endswith("�") or len(new_text) <= len(prefix_text):
+            # 字元尚未完整 (或為不輸出的特殊 token)，先暫緩
+            return ""
+        self.prefix_offset = self.read_offset
+        self.read_offset = len(self.ids)
+        return new_text[len(prefix_text):]
+
+    def flush(self) -> str:
+        prefix_text = decode_ids(self.ids[self.prefix_offset:self.read_offset])
+        new_text = decode_ids(self.ids[self.prefix_offset:])
+        self.prefix_offset = self.read_offset = len(self.ids)
+        # 生成結束時仍不完整的字元直接捨棄
+        return new_text[len(prefix_text):].rstrip("�")
+
+def _coerce_param(value: str, param_type: Optional[str]) -> Any:
+    if param_type == "string":
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+def parse_tool_calls(text: str, tools: Optional[List[Dict[str, Any]]]):
+    """解析 Qwen XML 格式的 <tool_call>，回傳 (前置文字, OpenAI 格式 tool_calls)"""
+    matches = list(TOOL_CALL_RE.finditer(text))
+    if not matches:
+        return text, []
+    schemas = {}
+    for t in tools or []:
+        fn = t.get("function", t)
+        if isinstance(fn, dict) and "name" in fn:
+            schemas[fn["name"]] = (fn.get("parameters") or {}).get("properties") or {}
+    calls = []
+    for m in matches:
+        name = m.group(1)
+        props = schemas.get(name, {})
+        args = {}
+        for pm in PARAM_RE.finditer(m.group(2)):
+            key = pm.group(1)
+            args[key] = _coerce_param(pm.group(2), (props.get(key) or {}).get("type"))
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}
+        })
+    return text[:matches[0].start()].strip(), calls
+
+def partial_tag_len(text: str, tag: str) -> int:
+    # text 結尾可能是 tag 前綴的最長長度，這段需暫緩輸出
+    for n in range(min(len(tag) - 1, len(text)), 0, -1):
+        if text.endswith(tag[:n]):
+            return n
+    return 0
+
+def generate_text(input_ids: np.ndarray, max_steps: int, temperature, top_p, user_stops: List[str], stats: Dict[str, int]):
+    """同步產生器 (呼叫端須持有 infer_lock)：逐步 yield (文字片段, finish_reason 或 None)"""
     seq_len = input_ids.shape[1]
-    print(f"📥 接收請求: Prompt Token 數 = {seq_len} | Tools 啟用: {has_tools}")
-
-    cur_embeds = cur_mask = cur_pos = None
     b_idx = np.zeros((1,), dtype=np.int32)
 
-    def prefill_setup():
-        # 必須在持有 infer_lock 時呼叫：c_embed 與 infer_req 皆為共用狀態
-        # 分段預填充：除最後一段外逐段送入 GPU 累積 KV cache，最後一段留給生成迴圈的第一次 infer 以取得 logits
-        nonlocal cur_embeds, cur_mask, cur_pos
+    # 分段預填充：除最後一段外逐段送入 GPU 累積 KV cache，最後一段留給生成迴圈的第一次 infer 以取得 logits
+    try:
         infer_req.reset_state()
         last_start = ((seq_len - 1) // PREFILL_CHUNK_TOKENS) * PREFILL_CHUNK_TOKENS
         for start in range(0, seq_len, PREFILL_CHUNK_TOKENS):
@@ -244,282 +309,179 @@ async def chat_completions(req: ChatCompletionRequest):
                 "position_ids": cur_pos,
                 "beam_idx": b_idx
             })
-        if seq_len > PREFILL_CHUNK_TOKENS:
-            print(f"🧩 分段預填充完成: {seq_len} tokens / 每段 {PREFILL_CHUNK_TOKENS}")
+    except Exception as e:
+        yield f"\n\n[系統錯誤: 預填充失敗 - {e}]", "error"
+        return
+    if seq_len > PREFILL_CHUNK_TOKENS:
+        print(f"🧩 分段預填充完成: {seq_len} tokens / 每段 {PREFILL_CHUNK_TOKENS}")
+
+    decoder = IncrementalDecoder()
+    text = ""
+    emitted = 0
+    for _ in range(max_steps):
+        try:
+            infer_req.infer({
+                "inputs_embeds": cur_embeds,
+                "attention_mask": cur_mask,
+                "position_ids": cur_pos,
+                "beam_idx": b_idx
+            })
+        except Exception as e:
+            yield f"\n\n[系統錯誤: 推論記憶體超限 - {e}]", "error"
+            return
+
+        logits = infer_req.get_output_tensor(0).data
+        next_token = sample_token(logits[0, -1, :], temperature, top_p)
+        if next_token in STOP_TOKEN_IDS:
+            yield decoder.flush(), "stop"
+            return
+        stats["completion_tokens"] += 1
+
+        text += decoder.add(next_token)
+        # 特殊標籤與使用者 stop 字串：截在最早出現的位置
+        hits = [i for i in (text.find(t) for t in list(SPECIAL_TAGS) + user_stops) if i >= 0]
+        if hits:
+            yield text[emitted:max(min(hits), emitted)], "stop"
+            return
+        yield text[emitted:], None
+        emitted = len(text)
+
+        cur_embeds = c_embed([np.array([[next_token]], dtype=np.int64)])[c_embed.outputs[0]]
+        cur_mask = np.ones((1, cur_mask.shape[1] + 1), dtype=np.int64)
+        cur_pos = np.full((4, 1, 1), cur_mask.shape[1] - 1, dtype=np.int64)
+
+    yield decoder.flush(), "length"
+
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def chat_completions(req: ChatCompletionRequest):
+    has_tools = has_tool_context(req)
+    max_steps = min(req.max_tokens or 512, MAX_CONTEXT_TOKENS // 2)
+    # prompt 與生成共用 MAX_CONTEXT_TOKENS 的 KV cache 空間
+    input_ids = build_input_ids(req, MAX_CONTEXT_TOKENS - max_steps)
+
+    seq_len = input_ids.shape[1]
+    print(f"📥 接收請求: Prompt Token 數 = {seq_len} | Tools 啟用: {has_tools}")
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_ts = int(time.time())
+    user_stops = [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
+    if not req.enable_thinking:
+        # 思考模式關閉時 prompt 已帶空的 <think></think>；模型在工具結果後偶爾仍會輸出 </think> 並重複回答，視為結束
+        user_stops.append("</think>")
+    parse_tools = bool(req.tools)
 
-    # 使用者自訂 stop 字串處理
-    user_stops = []
-    if req.stop:
-        if isinstance(req.stop, str):
-            user_stops = [req.stop]
-        elif isinstance(req.stop, list):
-            user_stops = req.stop
+    def run_generation():
+        stats = {"completion_tokens": 0}
+        return generate_text(input_ids, max_steps, req.temperature, req.top_p, user_stops, stats), stats
 
     # --- 1. 標準 SSE 串流協議 (OpenAI Streaming) ---
     if req.stream:
+        def make_chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
+            chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": MODEL_NAME,
+                "system_fingerprint": "fp_openvino_irisxe",
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "logprobs": None,
+                    "finish_reason": finish_reason
+                }]
+            }
+            return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
         async def openai_sse_generator():
-            nonlocal cur_embeds, cur_mask, cur_pos, b_idx
             async with infer_lock:
-                try:
-                    await run_in_threadpool(prefill_setup)
-                    prefill_error = None
-                except Exception as e:
-                    prefill_error = e
-            
-                # 第一包：建立角色區塊
-                first_chunk = {
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_ts,
-                    "model": MODEL_NAME,
-                    "system_fingerprint": "fp_openvino_irisxe",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
-                        "logprobs": None,
-                        "finish_reason": None
-                    }]
-                }
-                yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
-
-                accumulated_text = ""
-                stopped = False
-                if prefill_error is not None:
-                    err_chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": MODEL_NAME,
-                        "system_fingerprint": "fp_openvino_irisxe",
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": f"\n\n[系統錯誤: 預填充失敗 - {prefill_error}]"},
-                            "logprobs": None,
-                            "finish_reason": "error"
-                        }]
-                    }
-                    yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
-                    stopped = True
-                for step in range(0 if stopped else max_steps):
-                    inputs = {
-                        "inputs_embeds": cur_embeds,
-                        "attention_mask": cur_mask,
-                        "position_ids": cur_pos,
-                        "beam_idx": b_idx
-                    }
-                    try:
-                        await run_in_threadpool(infer_req.infer, inputs)
-                    except Exception as e:
-                        # 優雅降級回傳錯誤訊息，防止連線被強行中斷
-                        err_chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": MODEL_NAME,
-                            "system_fingerprint": "fp_openvino_irisxe",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": f"\n\n[系統錯誤: 推論記憶體超限 - {str(e)}]"},
-                                "logprobs": None,
-                                "finish_reason": "error"
-                            }]
-                        }
-                        yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
-                        stopped = True
+                yield make_chunk({"role": "assistant", "content": ""})
+                gen, _ = run_generation()
+                full_text = ""
+                pending = ""       # 暫緩送出、可能是 <tool_call> 開頭的文字
+                tool_start = -1    # full_text 中 <tool_call> 的位置
+                finish_reason = "length"
+                while True:
+                    item = await run_in_threadpool(next, gen, None)
+                    if item is None:
+                        break
+                    delta, finish = item
+                    full_text += delta
+                    if tool_start < 0 and delta:
+                        if parse_tools:
+                            pending += delta
+                            idx = pending.find(TOOL_CALL_OPEN)
+                            if idx >= 0:
+                                tool_start = len(full_text) - len(pending) + idx
+                                out, pending = pending[:idx], ""
+                            else:
+                                keep = partial_tag_len(pending, TOOL_CALL_OPEN)
+                                out, pending = pending[:len(pending) - keep], pending[len(pending) - keep:]
+                        else:
+                            out = delta
+                        if out:
+                            yield make_chunk({"content": out})
+                    if finish:
+                        finish_reason = finish
                         break
 
-                    logits = infer_req.get_output_tensor(0).data
-                    next_token = sample_token(logits[0, -1, :], req.temperature, req.top_p)
+                if tool_start >= 0:
+                    _, calls = parse_tool_calls(full_text[tool_start:], req.tools)
+                    if calls:
+                        yield make_chunk({"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]})
+                        finish_reason = "tool_calls"
+                    else:
+                        # 工具呼叫格式不完整 (例如被 max_tokens 截斷)，原樣當作文字送出
+                        yield make_chunk({"content": full_text[tool_start:]})
+                elif pending:
+                    yield make_chunk({"content": pending})
 
-                    # 1. 精確比對 Token ID
-                    if next_token in STOP_TOKEN_IDS:
-                        finish_chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": MODEL_NAME,
-                            "system_fingerprint": "fp_openvino_irisxe",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "logprobs": None,
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
-                        stopped = True
-                        break
-
-                    decoded_word = c_detok([np.array([[next_token]], dtype=np.int64)])["string_output"][0]
-
-                    # 2. 特殊標籤字串過濾
-                    if any(tag in decoded_word for tag in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]):
-                        finish_chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": MODEL_NAME,
-                            "system_fingerprint": "fp_openvino_irisxe",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "logprobs": None,
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
-                        stopped = True
-                        break
-
-                    # 3. 使用者自訂 stop 比對
-                    accumulated_text += decoded_word
-                    should_stop_user = False
-                    for s in user_stops:
-                        if s in accumulated_text:
-                            should_stop_user = True
-                            break
-                    if should_stop_user:
-                        finish_chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": MODEL_NAME,
-                            "system_fingerprint": "fp_openvino_irisxe",
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "logprobs": None,
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
-                        stopped = True
-                        break
-
-                    chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": MODEL_NAME,
-                        "system_fingerprint": "fp_openvino_irisxe",
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": decoded_word},
-                            "logprobs": None,
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                    next_in_ids = np.array([[next_token]], dtype=np.int64)
-                    cur_embeds = c_embed([next_in_ids])[c_embed.outputs[0]]
-                    cur_mask = np.ones((1, cur_mask.shape[1] + 1), dtype=np.int64)
-                    new_pos = np.zeros((4, 1, 1), dtype=np.int64)
-                    for i in range(4):
-                        new_pos[i, 0, 0] = cur_mask.shape[1] - 1
-                    cur_pos = new_pos
-
-                if not stopped:
-                    finish_chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": MODEL_NAME,
-                        "system_fingerprint": "fp_openvino_irisxe",
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "logprobs": None,
-                            "finish_reason": "length"
-                        }]
-                    }
-                    yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
-
+                yield make_chunk({}, finish_reason)
                 yield "data: [DONE]\n\n"
 
         return StreamingResponse(openai_sse_generator(), media_type="text/event-stream")
 
     # --- 2. 標準非串流 JSON 回應 ---
-    else:
-        def generate():
-            nonlocal cur_embeds, cur_mask, cur_pos
-            full_text = []
-            finish_reason = "length"
-            try:
-                prefill_setup()
-            except Exception as e:
-                full_text.append(f"\n[系統錯誤: 預填充失敗 - {e}]")
-                finish_reason = "error"
-            for step in range(0 if finish_reason == "error" else max_steps):
-                inputs = {
-                    "inputs_embeds": cur_embeds,
-                    "attention_mask": cur_mask,
-                    "position_ids": cur_pos,
-                    "beam_idx": b_idx
-                }
-                try:
-                    infer_req.infer(inputs)
-                except Exception as e:
-                    full_text.append(f"\n[系統錯誤: 推論記憶體超限 - {str(e)}]")
-                    finish_reason = "error"
-                    break
+    def generate_all():
+        gen, stats = run_generation()
+        parts, finish_reason = [], "length"
+        for delta, finish in gen:
+            parts.append(delta)
+            if finish:
+                finish_reason = finish
+                break
+        return "".join(parts), finish_reason, stats["completion_tokens"]
 
-                logits = infer_req.get_output_tensor(0).data
-                next_token = sample_token(logits[0, -1, :], req.temperature, req.top_p)
+    async with infer_lock:
+        content_str, finish_reason, completion_tokens = await run_in_threadpool(generate_all)
 
-                if next_token in STOP_TOKEN_IDS:
-                    finish_reason = "stop"
-                    break
+    message: Dict[str, Any] = {"role": "assistant", "content": content_str}
+    if parse_tools:
+        content, calls = parse_tool_calls(content_str, req.tools)
+        if calls:
+            message = {"role": "assistant", "content": content or None, "tool_calls": calls}
+            finish_reason = "tool_calls"
 
-                decoded_word = c_detok([np.array([[next_token]], dtype=np.int64)])["string_output"][0]
-                if any(tag in decoded_word for tag in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]):
-                    finish_reason = "stop"
-                    break
-
-                full_text.append(decoded_word)
-                current_so_far = "".join(full_text)
-                if any(s in current_so_far for s in user_stops):
-                    finish_reason = "stop"
-                    break
-
-                next_in_ids = np.array([[next_token]], dtype=np.int64)
-                cur_embeds = c_embed([next_in_ids])[c_embed.outputs[0]]
-                cur_mask = np.ones((1, cur_mask.shape[1] + 1), dtype=np.int64)
-                new_pos = np.zeros((4, 1, 1), dtype=np.int64)
-                for i in range(4):
-                    new_pos[i, 0, 0] = cur_mask.shape[1] - 1
-                cur_pos = new_pos
-
-            content_str = "".join(full_text)
-            return {
-                "id": chat_id,
-                "object": "chat.completion",
-                "created": created_ts,
-                "model": MODEL_NAME,
-                "system_fingerprint": "fp_openvino_irisxe",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": content_str
-                        },
-                        "logprobs": None,
-                        "finish_reason": finish_reason
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": seq_len,
-                    "completion_tokens": len(full_text),
-                    "total_tokens": seq_len + len(full_text)
-                }
+    return {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": created_ts,
+        "model": MODEL_NAME,
+        "system_fingerprint": "fp_openvino_irisxe",
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "logprobs": None,
+                "finish_reason": finish_reason
             }
-
-        async with infer_lock:
-            return await run_in_threadpool(generate)
+        ],
+        "usage": {
+            "prompt_tokens": seq_len,
+            "completion_tokens": completion_tokens,
+            "total_tokens": seq_len + completion_tokens
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
