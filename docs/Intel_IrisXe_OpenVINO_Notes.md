@@ -228,3 +228,47 @@ KV Cache = 16 層 × 2 (K/V) × 4 KV heads × 256 head_dim × N tokens × 2 byte
 * 預填充速度約 **10.5 tokens/s** → 滿載 16k prompt 首字延遲估計約 **25 分鐘**，適合離線長文，不適合互動聊天。
 * 若要縮短首字延遲，可在修改 `TdrDelay` 後調大 `PREFILL_CHUNK_TOKENS` (減少分段開銷)。
 
+
+---
+
+## 🔭 十、OpenVINO Model Server (OVMS) 導入前評估 (2026-09-16)
+
+OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI，內建工具呼叫/思考內容解析、連續批次與 prefix caching，可望取代自製的 `openai_server.py`。
+
+### 1. 模型版本相容性
+* 本機模型 = HF `OpenVINO/Qwen3.8-27B-int4-ov` 的 **`main`** 分支 (`openvino_language_model.xml` 9,736,672 bytes 與 main 一致)。
+* OVMS **2026.3.1 正式版已知問題**：預設 (main) 版本無法載入，須改用 HF 的 `2026.3.1` 分支 (約 15GB，權重不同)；**weekly 版無此限制**。
+* 選擇：(a) OVMS weekly + 現有模型 ← 建議；(b) 2026.3.1 正式版 + 重新下載 2026.3.1 分支；(c) 等 2026.4。
+
+### 2. 量化風險 (openvino.genai #4467)
+* 回報：此官方模型在 GenAI 2026.5 的 GPU/CPU 皆輸出亂碼，原因為 GatedDeltaNet (`linear_attn`) 被 INT4_ASYM ratio=1.0 量化且 `ignored_scope: null`。
+* 本機 `openvino_config.json` 同為 `ignored_scope: null`、`ratio: 1.0`，但**自製 stateful 流程輸出正常** → 問題可能在 GenAI 的連續批次 / paged attention 路徑。
+* OVMS 在 GPU 上一律使用 Continuous Batching (Stateful 僅用於 NPU)，**很可能踩到此問題 → 測試第一步先驗證輸出是否正常**。
+
+### 3. 設定對照
+| 自製伺服器 | OVMS 設定 | 建議值 |
+|---|---|---|
+| 分段預填充 128 | `max_num_batched_tokens` (預設 256) + `dynamic_split_fuse` (預設開) | 128 |
+| 16k 上下文 | `cache_size` (GB，0 = 動態) | 2 (26GB 權重 + 2GB ≤ 29.5GB) |
+| 自製 tool_calls 解析 | `--tool_parser` | `qwen3coder` |
+| `</think>` 停止 | `--reasoning_parser` | `qwen3` |
+| 無 | `enable_prefix_caching` | true (聊天歷史免重複預填充，對 ~10 tok/s 預填充效益極大) |
+| GPU 優先級 LOW | `plugin_config` | 待實測 |
+
+### 4. TDR 觀察修正
+* 登錄檔未設定 `TdrDelay` (即預設 2 秒)，但 2639 token 長 prompt 測試中**每段 128 token 平均約 12 秒仍未觸發 TDR** → TDR 判定的是單一 GPU 指令是否可被搶佔，而非整次 infer 時間。
+* 先前 `-14` 錯誤可能來自單次大量 token 的大型運算，確切原因未明；OVMS 測試先沿用 128 保守設定。
+
+### 5. 安裝要點
+* Windows 正式版：`ovms_windows_2026.3.1_python_off.zip` (103MB)；需 VC++ Redistributable (本機已安裝)。
+* 使用 `python_off` 版 (獨立執行檔)，官方警告勿與 pip 版 openvino 混用。
+* 解壓至專案外 (如 `C:\Users\USER\ovms`)，模型直接指向現有資料夾。
+
+### 6. 測試計畫
+1. 保守設定啟動：`target_device=GPU`、`cache_size=2`、`max_num_batched_tokens=128`、`tool_parser=qwen3coder`、`reasoning_parser=qwen3`、`enable_prefix_caching=true`
+2. 驗證輸出正常 (不過即停)
+3. 工具呼叫測試並與自製伺服器比較
+4. 長 prompt：TDR 與記憶體
+5. 多輪聊天：prefix caching 效果
+
+參考：[openvino.genai #4467](https://github.com/openvinotoolkit/openvino.genai/issues/4467)、[OVMS Releases](https://github.com/openvinotoolkit/model_server/releases)、[OVMS LLM reference](https://github.com/openvinotoolkit/model_server/blob/main/docs/llm/reference.md)
