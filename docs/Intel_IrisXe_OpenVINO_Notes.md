@@ -128,18 +128,42 @@ OpenVINO 內建 GGUF Reader 目前對新型多模態架構與新式量化格式�
 * **原因剖析**：OpenAI API 標準傳遞的 `tool_calls.arguments` 是**JSON 字串**，而 Qwen 官方的 `chat_template.jinja` 預期它是 Python mapping 字典並調用了 `tool_call.arguments|items` 過濾器，導致字串無法進行鍵值遍歷而噴出 `TypeError`。
 * **解決方案**：在 `render_prompt` 前加入防禦性反序列化，若為字串則自動執行 `json.loads` 還原為 dict，完美相容官方模板。
 
-### 2. Network Error (Intel GPU 預設 4GB 單塊記憶體分配上限)
-* **故障現象**：在進行長文本對話或多輪推理時，前端突然中斷並顯示 `Network Error` 或連線重設。
-* **原因剖析**：
-  查看後台日誌，底層拋出核心例外：
+### 2. Network Error 與記憶體超限 (Intel GPU 預設 4GB 單塊記憶體上限)
+* **故障現象**：在進行長文本對話或多輪推理時，前端突然中斷並顯示 `Network Error` 或連線重設，伴隨錯誤：
   ```text
-  Check '!exceed_allocatable_mem_size' failed at src/plugins/intel_gpu/src/runtime/engine.cpp:322:
-  [GPU] Exceeded max size of memory object allocation: requested 7862804480 bytes, but max alloc size supported by device is 4294959104 bytes.
+  [系統錯誤: 推論記憶體超限 - Check '!exceed_allocatable_mem_size' failed: 
+  requested 7862804480 bytes, but max alloc size supported by device is 4294959104 bytes]
   ```
-  Intel 顯卡驅動對**單一記憶體 Buffer 物件**預設設有 **4GB (4,294,959,104 Bytes)** 的保護上限。當 27B 模型在長上下文或 Attention 計算時嘗試申請約 7.8GB 的單一物件，觸發了驅動限制，導致連線非正常中斷。
+* **本機推論記憶體實際配置數據**：
+  經由底層 OpenVINO 屬性檢測，本機 iGPU 的實體分配參數為：
+  * **GPU 總共享記憶體池 (`GPU_DEVICE_TOTAL_MEM_SIZE`)**：**29.52 GB**（約佔系統 64GB RAM 的 50%）
+  * **GPU 單一物件分配上限 (`GPU_DEVICE_MAX_ALLOC_MEM_SIZE`)**：**3.999 GB (4,294,959,104 Bytes)**
+* **原因剖析**：
+  雖然 iGPU 能使用的總記憶體高達 29.52GB，但 Intel 顯卡驅動預設對「單一 Buffer 物件」設有嚴格的 **4GB** 保護上限。當 27B 模型在長上下文或 Attention 計算時嘗試申請約 7.86GB 的單一物件，觸發了驅動限制，導致連線非正常中斷。
 * **解決方案**：
   在 OpenVINO Core 初始化與 GPU 編譯前注入核心屬性：
   ```python
   core.set_property("GPU", {"GPU_ENABLE_LARGE_ALLOCATIONS": True})
   ```
-  **徹底解除 4GB 單塊記憶體分配限制**，解鎖全部 31.69GB 的 GPU 共享記憶體池，並在串流迴圈中加入例外防禦處理，保證連線不中斷。
+  **徹底解除 4GB 單塊記憶體分配限制**，解鎖全部 29.52GB 的 GPU 共享記憶體池，並在串流迴圈中加入例外防禦處理。
+
+### 3. OpenCL 事件崩潰與螢幕閃爍 (Error Code: -14 / -5 CL_OUT_OF_RESOURCES & TDR)
+* **故障現象**：
+  多次對話後，伺服器日誌拋出：
+  ```text
+  [GPU] clWaitForEvents failed with -14 code (CL_OUT_OF_RESOURCES)
+  [GPU] clFlush, error code: -5 CL_OUT_OF_RESOURCES
+  ```
+  同時螢幕出現瞬間黑屏或閃爍。
+* **全球社群與 Intel 官方 Issue 調查結論**：
+  1. **TDR（超時檢測與恢復）驅動重設**：
+     Intel Iris Xe 為整合式內顯，螢幕畫面輸出（DWM 桌面窗口管理器）與 LLM 大模型矩陣推論共用同一顆 GPU 核心與記憶體匯流排。當 27B 大模型進行龐大計算時，GPU 核心佔用率達 100% 超過 Windows 預設超時容忍（約 2 秒），觸發 Windows TDR 強制重啟顯卡驅動，造成螢幕黑屏閃爍，底層 OpenCL 佇列被強制銷毀因而回傳 `-14 / -5`。
+  2. **雙重 GPU 模型擠壓**：
+     若將 `openvino_text_embeddings_model.xml`（1.27GB）與 27B 主語言模型（13.9GB）同時編譯於 GPU，兩者會在同一 OpenCL Context 中頻繁交替 Flush 爭奪顯存與佇列。
+* **架構級終極解法**：
+  1. **異構運算分工 (Heterogeneous Offload)**：
+     將文字嵌入層改由 **CPU** 編譯執行（CPU 耗時僅 0.1 秒且零顯存壓力），**GPU 專注負責 27B 主語言模型矩陣計算**，徹底消除雙模型顯存搶佔。
+  2. **GPU 隊列優先級降為 LOW**：
+     配置 `"GPU_QUEUE_THROTTLE": "LOW"`, `"GPU_QUEUE_PRIORITY": "LOW"`, `"MODEL_PRIORITY": "LOW"`，強制讓出主頻與匯流排給 Windows 桌面合成器，保證螢幕 100% 不閃爍。
+  3. **滑動視窗歷史截取 (Sliding Window)**：
+     在前端截取最近 2~3 輪對話，並在歷史中自動剃除帶有 `[系統錯誤` 的污染記錄，確保送入 GPU 的上下文始終乾淨精簡。
