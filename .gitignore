@@ -1,0 +1,18 @@
+# 依賴套件清單與環境快取 (不納入 git)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.cache/
+
+# 大型模型權重目錄 (14.87GB 模型請透過專案下載腳本自動下載，避免上傳 Git)
+models/
+*.bin
+*.xml
+*.onnx
+
+# 系統與 IDE 設定
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

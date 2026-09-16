@@ -1,0 +1,35 @@
+Total GGUF files found: 13
+
+==========================================
+Testing model: Bonsai-27B-Q1_0.gguf
+Result: FAILED (IndexError: invalid unordered_map<K, T> key)
+
+==========================================
+Testing model: gemma-4-12B-it-QAT-Q4_0.gguf
+Result: FAILED (IndexError: invalid unordered_map<K, T> key)
+
+==========================================
+Testing model: gemma-4-26B-A4B-it-QAT-Q4_0.gguf
+Result: FAILED (IndexError: invalid unordered_map<K, T> key)
+
+==========================================
+Testing model: gemma-4-E4B-it-Q4_K_M.gguf
+Result: FAILED (RuntimeError: Exception from C:\Jenkins\workspace\private-ci\ie\build-windows-vs2022\b\repos\openvino.genai\src\cpp\src\gguf_utils\gguf_modeling.cpp:166:
+Unsupported model architecture 'gemma4'
+)
+
+==========================================
+Testing model: Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf
+Result: FAILED (RuntimeError: Check 'data != nullptr' failed at C:\Jenkins\workspace\private-ci\ie\build-windows-vs2022\b\repos\openvino.genai\src\cpp\src\gguf_utils\gguf.cpp:96:
+[load_gguf] gguf_tensor_to_f16 failed
+)
+
+==========================================
+Testing model: NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf
+Result: FAILED (RuntimeError: Check 'data != nullptr' failed at C:\Jenkins\workspace\private-ci\ie\build-windows-vs2022\b\repos\openvino.genai\src\cpp\src\gguf_utils\gguf.cpp:96:
+[load_gguf] gguf_tensor_to_f16 failed
+)
+
+==========================================
+Testing model: Qwen3.8-27B-Q4_K_M.gguf
+Result: FAILED (IndexError: invalid unordered_map<K, T> key)
