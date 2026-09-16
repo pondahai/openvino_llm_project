@@ -272,3 +272,20 @@ OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI
 5. 多輪聊天：prefix caching 效果
 
 參考：[openvino.genai #4467](https://github.com/openvinotoolkit/openvino.genai/issues/4467)、[OVMS Releases](https://github.com/openvinotoolkit/model_server/releases)、[OVMS LLM reference](https://github.com/openvinotoolkit/model_server/blob/main/docs/llm/reference.md)
+
+### 7. 實測結果 (OVMS weekly 2026.5.0.6ec5e369，2026-09-16)
+* 套件：`ovms_windows_2026.5.0_python_on.zip` (133MB，SHA256 已核對)，解壓於 `C:\Users\USER\ovms_pkg`，啟動腳本 `start_ovms.ps1`。
+* **`--pipeline_type` 必須為 `VLM_CB`**：模型資料夾含視覺元件，設 `LM_CB` 會出現 `Models directory content indicates VLM pipeline` 而無法載入。
+* 載入約 90 秒；ovms 程序常駐記憶體約 17.8GB；KV cache 靜態 1.9GB，長文測試僅用 7.7%。
+* **#4467 亂碼問題未出現**：本機 main 版模型在 OVMS 2026.5 GPU 上輸出正常。
+
+| 測試 | 自製伺服器 | OVMS |
+|---|---|---|
+| 「用一句話介紹台北」 | 8 tokens / 8.1s | 30 tokens / 21s (輸出正常) |
+| 工具呼叫 (非串流 / 串流) | 58s / 55s ✅ | 43s / 43s ✅ (`qwen3coder` 解析正確) |
+| 工具結果回傳 | 105s ✅ (伺服器端停在 `</think>`) | 56s ✅ **需客戶端傳 `stop: ["</think>"]`**，否則同樣重複回答 |
+| 長文 2639 tokens | 250s，答案正確 | 300s，答案正確，無 TDR |
+| 長文第 2 輪 (prefix caching) | 需整段重新預填充 (~250s) | **5s** ✅ 答案正確 |
+
+* 結論：OVMS 的 prefix caching 讓多輪對話從數分鐘降到數秒，是最大優勢；首輪長文預填充比自製版慢約 20%。
+* 待處理：`</think>` 重複問題需客戶端處理 (或加代理層)；GPU 優先級 `plugin_config` 是否生效未驗證。
