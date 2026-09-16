@@ -45,12 +45,20 @@ chat_template = jinja_env.get_template("chat_template.jinja")
 
 core = ov.Core()
 
-# 關鍵配置：解鎖 Intel GPU 單次大塊記憶體分配限制 (突破 4GB 預設限制，充分發揮 64GB 記憶體能力)
+# 關鍵配置：
+# 1. 解鎖 Intel GPU 單次大塊記憶體分配限制 (突破 4GB 預設限制，充分發揮 64GB 記憶體能力)
+# 2. 降低 GPU 隊列與模型優先級，讓出 Windows 桌面渲染與合成器資源，徹底杜絕螢幕閃爍與 TDR 驅動重設
+gpu_config = {
+    "GPU_ENABLE_LARGE_ALLOCATIONS": True,
+    "GPU_QUEUE_THROTTLE": "LOW",
+    "GPU_QUEUE_PRIORITY": "LOW",
+    "MODEL_PRIORITY": "LOW"
+}
 try:
-    core.set_property("GPU", {"GPU_ENABLE_LARGE_ALLOCATIONS": True})
-    print("⚡ 已成功開啟 Intel GPU 大塊記憶體分配支援 (GPU_ENABLE_LARGE_ALLOCATIONS = True)！")
+    core.set_property("GPU", gpu_config)
+    print("⚡ 已成功開啟大塊記憶體支援並設定 GPU 優先級為 LOW (讓出桌面渲染，防止螢幕閃爍)！")
 except Exception as e:
-    print(f"⚠️ 設定 GPU_ENABLE_LARGE_ALLOCATIONS 警告: {e}")
+    print(f"⚠️ 設定 GPU 屬性警告: {e}")
 
 print("[1/3] 載入 Tokenizer & Detokenizer...")
 tok_m = core.read_model(os.path.join(MODEL_DIR, "openvino_tokenizer.xml"))

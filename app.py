@@ -39,9 +39,10 @@ with st.sidebar:
     except Exception as e:
         st.error(f"🔴 無法連線至後端伺服器 (http://127.0.0.1:1234/v1)\n請先執行 `run_api_server.bat` 啟動伺服器！")
         
-    st.info("💻 運算設備：Intel Iris Xe (由 Server 統一調度)")
+    st.info("💻 運算設備：Intel Iris Xe (已配置 Priority.LOW 保護螢幕不閃爍)")
     
-    max_tokens = st.slider("最大輸出長度 (Max Tokens)", 64, 512, 180, step=32)
+    max_tokens = st.slider("最大輸出長度 (Max Tokens)", 64, 384, 160, step=32)
+    history_turns = st.slider("歷史對話保留輪數", 1, 10, 3, step=1, help="限制送入 GPU 的對話輪數，避免超長歷史導致內顯 TDR 驅動重置或顯存超限")
     temperature = st.slider("溫度 (Temperature)", 0.0, 1.5, 0.7, step=0.1)
     top_p = st.slider("Top P", 0.1, 1.0, 0.9, step=0.05)
     enable_thinking = st.checkbox("啟用深層思考 (<think> 模式)", value=False)
@@ -57,6 +58,7 @@ with st.sidebar:
     * 記憶體單一實例：僅佔用約 26 GB（不重複載入）
     * Agent 與 GUI 共用同一個後台
     * 標準 OpenAI API 串流通訊
+    * GPU 優先級自動調節，保護桌面流暢
     """)
     
     if st.button("🧹 清空對話記錄"):
@@ -87,9 +89,10 @@ if user_prompt := st.chat_input("請輸入訊息，透過 OpenVINO Server 開始
         status_box.info("⚡ 透過 OpenAI API 串流要求 OpenVINO Server 生成中...")
         
         try:
-            # 準備請求訊息清單
+            # 滑動視窗截取最近 N 輪對話（避免過多歷史造成 GPU TDR 閃爍與崩潰）
+            recent_msgs = st.session_state.messages[-(history_turns * 2):]
             req_messages = [{"role": "system", "content": system_prompt}]
-            for m in st.session_state.messages:
+            for m in recent_msgs:
                 req_messages.append({"role": m["role"], "content": m["content"]})
             
             start_t = time.time()
