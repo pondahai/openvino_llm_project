@@ -44,6 +44,14 @@ jinja_env = Environment(loader=FileSystemLoader(MODEL_DIR))
 chat_template = jinja_env.get_template("chat_template.jinja")
 
 core = ov.Core()
+
+# 關鍵配置：解鎖 Intel GPU 單次大塊記憶體分配限制 (突破 4GB 預設限制，充分發揮 64GB 記憶體能力)
+try:
+    core.set_property("GPU", {"GPU_ENABLE_LARGE_ALLOCATIONS": True})
+    print("⚡ 已成功開啟 Intel GPU 大塊記憶體分配支援 (GPU_ENABLE_LARGE_ALLOCATIONS = True)！")
+except Exception as e:
+    print(f"⚠️ 設定 GPU_ENABLE_LARGE_ALLOCATIONS 警告: {e}")
+
 print("[1/3] 載入 Tokenizer & Detokenizer...")
 tok_m = core.read_model(os.path.join(MODEL_DIR, "openvino_tokenizer.xml"))
 detok_m = core.read_model(os.path.join(MODEL_DIR, "openvino_detokenizer.xml"))
@@ -225,7 +233,27 @@ async def chat_completions(req: ChatCompletionRequest):
                     "position_ids": cur_pos,
                     "beam_idx": b_idx
                 }
-                infer_req.infer(inputs)
+                try:
+                    infer_req.infer(inputs)
+                except Exception as e:
+                    # 優雅降級回傳錯誤訊息，防止連線被強行中斷
+                    err_chunk = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": MODEL_NAME,
+                        "system_fingerprint": "fp_openvino_irisxe",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"\n\n[系統錯誤: 推論記憶體超限 - {str(e)}]"},
+                            "logprobs": None,
+                            "finish_reason": "error"
+                        }]
+                    }
+                    yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                    stopped = True
+                    break
+
                 logits = infer_req.get_output_tensor(0).data
                 next_token = sample_token(logits[0, -1, :], req.temperature, req.top_p)
 
@@ -349,7 +377,13 @@ async def chat_completions(req: ChatCompletionRequest):
                 "position_ids": cur_pos,
                 "beam_idx": b_idx
             }
-            infer_req.infer(inputs)
+            try:
+                infer_req.infer(inputs)
+            except Exception as e:
+                full_text.append(f"\n[系統錯誤: 推論記憶體超限 - {str(e)}]")
+                finish_reason = "error"
+                break
+
             logits = infer_req.get_output_tensor(0).data
             next_token = sample_token(logits[0, -1, :], req.temperature, req.top_p)
 
