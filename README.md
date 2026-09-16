@@ -74,7 +74,7 @@ OVMS 支援 **prefix caching**：多輪對話不需重新預填充整段歷史 (
    `https://storage.openvinotoolkit.org/repositories/openvino_model_server/packages/weekly/latest/`
 2. 解壓後以 `-OvmsDir` 或環境變數 `OVMS_DIR` 指定 `ovms` 資料夾，雙擊 `run_ovms.bat` 或執行：
 ```powershell
-.\start_ovms.ps1 -OvmsDir C:\path	o\ovms
+.\start_ovms.ps1 -OvmsDir C:\path\to\ovms
 ```
 3. API 位址為 `http://127.0.0.1:8000/v3`，模型名稱 `qwen3.8-27b-ovms`；GUI 側邊欄可切換後端。
 4. 關閉思考模式時請在請求加上 `stop: ["</think>"]` (模型偶爾在回答後輸出 `</think>` 並重複回答)：
