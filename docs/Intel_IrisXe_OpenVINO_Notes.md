@@ -116,3 +116,30 @@ OpenVINO 內建 GGUF Reader 目前對新型多模態架構與新式量化格式�
 
 ### 2. 模式 B：獨立 GUI 模式
 ![Standalone GUI Showcase](images/gui_showcase.png)
+
+---
+
+## 🛠️ 八、實戰除錯與核心避坑實錄 (500 Error & Network Error 覆盤)
+
+在部署與對接 Agent 的過程中，我們遇到了兩個極具代表性的經典底層故障，具備極高的社群覆盤參考價值：
+
+### 1. 500 Internal Server Error (Jinja2 Tool Calls 反序列化陷阱)
+* **故障現象**：發送帶有工具調用（Function Calling）的多輪歷史時，後台直接崩潰拋出 500 錯誤。
+* **原因剖析**：OpenAI API 標準傳遞的 `tool_calls.arguments` 是**JSON 字串**，而 Qwen 官方的 `chat_template.jinja` 預期它是 Python mapping 字典並調用了 `tool_call.arguments|items` 過濾器，導致字串無法進行鍵值遍歷而噴出 `TypeError`。
+* **解決方案**：在 `render_prompt` 前加入防禦性反序列化，若為字串則自動執行 `json.loads` 還原為 dict，完美相容官方模板。
+
+### 2. Network Error (Intel GPU 預設 4GB 單塊記憶體分配上限)
+* **故障現象**：在進行長文本對話或多輪推理時，前端突然中斷並顯示 `Network Error` 或連線重設。
+* **原因剖析**：
+  查看後台日誌，底層拋出核心例外：
+  ```text
+  Check '!exceed_allocatable_mem_size' failed at src/plugins/intel_gpu/src/runtime/engine.cpp:322:
+  [GPU] Exceeded max size of memory object allocation: requested 7862804480 bytes, but max alloc size supported by device is 4294959104 bytes.
+  ```
+  Intel 顯卡驅動對**單一記憶體 Buffer 物件**預設設有 **4GB (4,294,959,104 Bytes)** 的保護上限。當 27B 模型在長上下文或 Attention 計算時嘗試申請約 7.8GB 的單一物件，觸發了驅動限制，導致連線非正常中斷。
+* **解決方案**：
+  在 OpenVINO Core 初始化與 GPU 編譯前注入核心屬性：
+  ```python
+  core.set_property("GPU", {"GPU_ENABLE_LARGE_ALLOCATIONS": True})
+  ```
+  **徹底解除 4GB 單塊記憶體分配限制**，解鎖全部 31.69GB 的 GPU 共享記憶體池，並在串流迴圈中加入例外防禦處理，保證連線不中斷。
