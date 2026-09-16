@@ -66,14 +66,16 @@ detok_m = core.read_model(os.path.join(MODEL_DIR, "openvino_detokenizer.xml"))
 c_tok = core.compile_model(tok_m, "CPU")
 c_detok = core.compile_model(detok_m, "CPU")
 
-print("[2/3] 載入 Text Embeddings 至 Iris Xe GPU...")
+print("[2/3] 載入 Text Embeddings 至 CPU (節省 GPU 顯存與減輕驅動壓力)...")
 embed_m = core.read_model(os.path.join(MODEL_DIR, "openvino_text_embeddings_model.xml"))
-c_embed = core.compile_model(embed_m, "GPU")
+c_embed = core.compile_model(embed_m, "CPU")
 
 print("[3/3] 載入 27B 語言模型至 Intel Iris Xe GPU...")
 lm_m = core.read_model(os.path.join(MODEL_DIR, "openvino_language_model.xml"))
 c_lm = core.compile_model(lm_m, "GPU")
-print("✅ 模型全數載入 Iris Xe 完畢！API 伺服器就緒！\n")
+# 重複使用固定的 infer_request 物件，每次呼叫前 reset_state()
+infer_req = c_lm.create_infer_request()
+print("✅ 模型全數載入完畢！API 伺服器就緒！\n")
 
 # Pydantic 數據結構嚴格相容 OpenAI
 class ChatMessage(BaseModel):
@@ -197,7 +199,6 @@ async def chat_completions(req: ChatCompletionRequest):
         cur_pos[i, 0, :] = np.arange(seq_len, dtype=np.int64)
     b_idx = np.zeros((1,), dtype=np.int32)
     
-    infer_req = c_lm.create_infer_request()
     infer_req.reset_state()
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_ts = int(time.time())

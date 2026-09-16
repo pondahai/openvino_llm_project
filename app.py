@@ -42,7 +42,7 @@ with st.sidebar:
     st.info("💻 運算設備：Intel Iris Xe (已配置 Priority.LOW 保護螢幕不閃爍)")
     
     max_tokens = st.slider("最大輸出長度 (Max Tokens)", 64, 384, 160, step=32)
-    history_turns = st.slider("歷史對話保留輪數", 1, 10, 3, step=1, help="限制送入 GPU 的對話輪數，避免超長歷史導致內顯 TDR 驅動重置或顯存超限")
+    history_turns = st.slider("歷史對話保留輪數", 1, 5, 2, step=1, help="限制送入 GPU 的對話輪數，避免超長歷史導致內顯 TDR 驅動重置或顯存超限")
     temperature = st.slider("溫度 (Temperature)", 0.0, 1.5, 0.7, step=0.1)
     top_p = st.slider("Top P", 0.1, 1.0, 0.9, step=0.05)
     enable_thinking = st.checkbox("啟用深層思考 (<think> 模式)", value=False)
@@ -89,11 +89,17 @@ if user_prompt := st.chat_input("請輸入訊息，透過 OpenVINO Server 開始
         status_box.info("⚡ 透過 OpenAI API 串流要求 OpenVINO Server 生成中...")
         
         try:
-            # 滑動視窗截取最近 N 輪對話（避免過多歷史造成 GPU TDR 閃爍與崩潰）
-            recent_msgs = st.session_state.messages[-(history_turns * 2):]
+            # 嚴格只取有效對話歷史（排除之前的系統錯誤訊息），並截取最近 N 輪
+            valid_history = [
+                m for m in st.session_state.messages[:-1] 
+                if not m["content"].startswith("[系統錯誤")
+            ]
+            recent_msgs = valid_history[-(history_turns * 2):]
+            
             req_messages = [{"role": "system", "content": system_prompt}]
             for m in recent_msgs:
                 req_messages.append({"role": m["role"], "content": m["content"]})
+            req_messages.append({"role": "user", "content": user_prompt})
             
             start_t = time.time()
             metrics = {"first_token_time": None, "count": 0}
