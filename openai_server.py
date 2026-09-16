@@ -39,8 +39,12 @@ print("  啟動 OpenVINO OpenAI-Compatible Server (Port 1234)")
 print("  完整支援 Agent 框架 (LangChain/AutoGen/CrewAI/LM Studio)")
 print("==========================================================")
 
-# Jinja2 模板
+# Jinja2 模板與自定義例外輔助函式
+def _jinja_raise_exception(msg: str):
+    raise ValueError(msg)
+
 jinja_env = Environment(loader=FileSystemLoader(MODEL_DIR))
+jinja_env.globals["raise_exception"] = _jinja_raise_exception
 chat_template = jinja_env.get_template("chat_template.jinja")
 
 core = ov.Core()
@@ -58,24 +62,19 @@ try:
     core.set_property("GPU", gpu_config)
     print("⚡ 已成功開啟大塊記憶體支援並設定 GPU 優先級為 LOW (讓出桌面渲染，防止螢幕閃爍)！")
 except Exception as e:
-    print(f"⚠️ 設定 GPU 屬性警告: {e}")
+    print(f"⚠️ 設定 GPU 屬性時發生提示: {e}")
 
-print("[1/3] 載入 Tokenizer & Detokenizer...")
-tok_m = core.read_model(os.path.join(MODEL_DIR, "openvino_tokenizer.xml"))
-detok_m = core.read_model(os.path.join(MODEL_DIR, "openvino_detokenizer.xml"))
-c_tok = core.compile_model(tok_m, "CPU")
-c_detok = core.compile_model(detok_m, "CPU")
+print("\n[1/3] 載入 Tokenizer & Detokenizer...")
+c_tok = core.compile_model(os.path.join(MODEL_DIR, "openvino_tokenizer.xml"), "CPU")
+c_detok = core.compile_model(os.path.join(MODEL_DIR, "openvino_detokenizer.xml"), "CPU")
 
-print("[2/3] 載入 Text Embeddings 至 CPU (節省 GPU 顯存與減輕驅動壓力)...")
-embed_m = core.read_model(os.path.join(MODEL_DIR, "openvino_text_embeddings_model.xml"))
-c_embed = core.compile_model(embed_m, "CPU")
+print("[2/3] 載入 Text Embeddings 至 CPU (節省 GPU 顯存與輕量化預填充)...")
+c_embed = core.compile_model(os.path.join(MODEL_DIR, "openvino_text_embeddings_model.xml"), "CPU")
 
 print("[3/3] 載入 27B 語言模型至 Intel Iris Xe GPU...")
-lm_m = core.read_model(os.path.join(MODEL_DIR, "openvino_language_model.xml"))
-c_lm = core.compile_model(lm_m, "GPU")
-# 重複使用固定的 infer_request 物件，每次呼叫前 reset_state()
+c_lm = core.compile_model(os.path.join(MODEL_DIR, "openvino_language_model.xml"), "GPU")
 infer_req = c_lm.create_infer_request()
-print("✅ 模型全數載入完畢！API 伺服器就緒！\n")
+print("🎉 模型參數載入完畢！API 伺服器就緒。\n")
 
 # Pydantic 數據結構嚴格相容 OpenAI
 class ChatMessage(BaseModel):
@@ -96,16 +95,22 @@ class ChatCompletionRequest(BaseModel):
     enable_thinking: Optional[bool] = False
 
 def render_prompt(req: ChatCompletionRequest) -> str:
-    msgs_data = []
-    # 為避免 Intel Iris Xe 內顯在 Prefill 階段超過 Windows 2秒 TDR 逾時門檻 (引發螢幕閃爍與 OpenCL -14)
-    # 保留 System 提示詞，對話歷史採取滑動窗口機制 (只保留最近 1-2 輪，最多約 3 則訊息)
-    system_msgs = [m for m in req.messages if m.role == "system"]
-    conversation_msgs = [m for m in req.messages if m.role != "system"]
+    # 智能對話視窗：
+    # 如果包含 tools 或 tool 角色，表示處於 Agent / Function Calling 流程，必須保留完整工具調用上下文！
+    has_tools = bool(req.tools or any(m.role == "tool" or m.tool_calls for m in req.messages))
     
-    # 取最近 2 則訊息 (例如上一輪 Assistant 與當前 User)
-    truncated_conv = conversation_msgs[-2:] if len(conversation_msgs) > 2 else conversation_msgs
-    active_msgs = system_msgs + truncated_conv
+    if has_tools:
+        # Agent 流程：保留完整 messages 結構，確保 chat_template 能找到 user query 與對應的 tool_calls/tool_response
+        active_msgs = req.messages
+    else:
+        # 普通純文字對話：採用滑動窗口機制保護內顯免於超長累積導致 TDR
+        system_msgs = [m for m in req.messages if m.role == "system"]
+        conversation_msgs = [m for m in req.messages if m.role != "system"]
+        # 保留最近 4 則對話，確保對話連貫性與安全
+        truncated_conv = conversation_msgs[-4:] if len(conversation_msgs) > 4 else conversation_msgs
+        active_msgs = system_msgs + truncated_conv
 
+    msgs_data = []
     for m in active_msgs:
         item = {"role": m.role, "content": m.content if isinstance(m.content, str) else str(m.content)}
         if m.tool_calls:
@@ -198,12 +203,15 @@ async def chat_completions(req: ChatCompletionRequest):
     tok_res = c_tok([formatted_prompt])
     input_ids = tok_res["input_ids"]
     
-    # 內顯安全防護：若 Prompt 超過 200 tokens，截取最近 200 tokens，防止 Prefill 超過 2 秒引發 Windows TDR 斷線
-    MAX_PROMPT_TOKENS = 200
-    if input_ids.shape[1] > MAX_PROMPT_TOKENS:
-        input_ids = input_ids[:, -MAX_PROMPT_TOKENS:]
+    # 內顯安全防護：
+    # 如果有 Tool 呼叫或回傳，保留較多上下文 (上限 1024)；普通閒聊保持 384 tokens，避免 TDR 逾時
+    has_tools = bool(req.tools or any(m.role == "tool" or m.tool_calls for m in req.messages))
+    max_safe_tokens = 1024 if has_tools else 384
+    if input_ids.shape[1] > max_safe_tokens:
+        input_ids = input_ids[:, -max_safe_tokens:]
         
     seq_len = input_ids.shape[1]
+    print(f"📥 接收請求: Prompt Token 數 = {seq_len} | Tools 啟用: {has_tools}")
     
     embed_res = c_embed([input_ids])
     cur_embeds = embed_res[c_embed.outputs[0]]
