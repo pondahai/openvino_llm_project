@@ -36,7 +36,7 @@ STOP_TOKEN_IDS = {248046, 248044, 248045, 151643, 151645}
 
 print("==========================================================")
 print("  啟動 OpenVINO OpenAI-Compatible Server (Port 1234)")
-print("  完整支援 Agent 框架 (LangChain/AutoGen/CrewAI)")
+print("  完整支援 Agent 框架 (LangChain/AutoGen/CrewAI/LM Studio)")
 print("==========================================================")
 
 # Jinja2 模板
@@ -64,7 +64,7 @@ class ChatMessage(BaseModel):
     role: str
     content: Optional[Union[str, List[Any]]] = ""
     name: Optional[str] = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_calls: Optional[List[Any]] = None
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = MODEL_NAME
@@ -82,7 +82,21 @@ def render_prompt(req: ChatCompletionRequest) -> str:
     for m in req.messages:
         item = {"role": m.role, "content": m.content if isinstance(m.content, str) else str(m.content)}
         if m.tool_calls:
-            item["tool_calls"] = m.tool_calls
+            normalized_tool_calls = []
+            for tc in m.tool_calls:
+                # 兼容 dict 與物件結構
+                if isinstance(tc, dict):
+                    tc_copy = dict(tc)
+                    fn = tc_copy.get("function")
+                    if isinstance(fn, dict) and "arguments" in fn and isinstance(fn["arguments"], str):
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"])
+                        except Exception:
+                            pass
+                    normalized_tool_calls.append(tc_copy)
+                else:
+                    normalized_tool_calls.append(tc)
+            item["tool_calls"] = normalized_tool_calls
         msgs_data.append(item)
         
     return chat_template.render(
@@ -135,6 +149,17 @@ def list_models():
                 "parent": None
             }
         ]
+    }
+
+# 兼容 LM Studio / Ollama / LocalAI 的端點
+@app.get("/api/v0/models")
+@app.get("/api/v0/models/{model_id:path}")
+def get_v0_models(model_id: Optional[str] = None):
+    return {
+        "id": MODEL_NAME,
+        "object": "model",
+        "name": MODEL_NAME,
+        "max_context_length": 262144
     }
 
 @app.post("/v1/chat/completions")
@@ -192,6 +217,7 @@ async def chat_completions(req: ChatCompletionRequest):
             yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
             accumulated_text = ""
+            stopped = False
             for step in range(max_steps):
                 inputs = {
                     "inputs_embeds": cur_embeds,
@@ -219,6 +245,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         }]
                     }
                     yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+                    stopped = True
                     break
 
                 decoded_word = c_detok([np.array([[next_token]], dtype=np.int64)])["string_output"][0]
@@ -239,6 +266,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         }]
                     }
                     yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+                    stopped = True
                     break
 
                 # 3. 使用者自訂 stop 比對
@@ -263,6 +291,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         }]
                     }
                     yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+                    stopped = True
                     break
 
                 chunk = {
@@ -289,6 +318,22 @@ async def chat_completions(req: ChatCompletionRequest):
                     new_pos[i, 0, 0] = cur_mask.shape[1] - 1
                 cur_pos = new_pos
 
+            if not stopped:
+                finish_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": MODEL_NAME,
+                    "system_fingerprint": "fp_openvino_irisxe",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "logprobs": None,
+                        "finish_reason": "length"
+                    }]
+                }
+                yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(openai_sse_generator(), media_type="text/event-stream")
@@ -296,6 +341,7 @@ async def chat_completions(req: ChatCompletionRequest):
     # --- 2. 標準非串流 JSON 回應 ---
     else:
         full_text = []
+        finish_reason = "length"
         for step in range(max_steps):
             inputs = {
                 "inputs_embeds": cur_embeds,
@@ -308,15 +354,18 @@ async def chat_completions(req: ChatCompletionRequest):
             next_token = sample_token(logits[0, -1, :], req.temperature, req.top_p)
 
             if next_token in STOP_TOKEN_IDS:
+                finish_reason = "stop"
                 break
 
             decoded_word = c_detok([np.array([[next_token]], dtype=np.int64)])["string_output"][0]
             if any(tag in decoded_word for tag in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]):
+                finish_reason = "stop"
                 break
 
             full_text.append(decoded_word)
             current_so_far = "".join(full_text)
             if any(s in current_so_far for s in user_stops):
+                finish_reason = "stop"
                 break
 
             next_in_ids = np.array([[next_token]], dtype=np.int64)
@@ -342,7 +391,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         "content": content_str
                     },
                     "logprobs": None,
-                    "finish_reason": "stop"
+                    "finish_reason": finish_reason
                 }
             ],
             "usage": {
