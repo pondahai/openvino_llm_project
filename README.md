@@ -68,7 +68,7 @@ for chunk in response:
 ```
 
 ### 4. (推薦) 使用 OpenVINO Model Server (OVMS) 作為後端
-OVMS 支援 **prefix caching**：多輪對話不需重新預填充整段歷史 (實測 2639 tokens 長文第 2 輪由約 250 秒降到 5 秒)，並內建工具呼叫解析。
+OVMS 為 Intel 官方推論伺服器，內建工具呼叫解析與 **prefix caching** (可同時快取多段對話)。自製伺服器也支援 prefix caching，但只保留最近一段對話的狀態。
 
 1. 下載 OVMS Windows 套件 (weekly 版，正式版 2026.3.1 無法載入本模型的 main 版本)：
    `https://storage.openvinotoolkit.org/repositories/openvino_model_server/packages/weekly/latest/`

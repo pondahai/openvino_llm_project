@@ -289,3 +289,26 @@ OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI
 
 * 結論：OVMS 的 prefix caching 讓多輪對話從數分鐘降到數秒，是最大優勢；首輪長文預填充比自製版慢約 20%。
 * 待處理：`</think>` 重複問題需客戶端處理 (或加代理層)；GPU 優先級 `plugin_config` 是否生效未驗證。
+
+---
+
+## ♻️ 十一、自製伺服器的 Prefix Caching (2026-09-16)
+
+### 1. 設計
+* 全域 `kv_cache_ids` 記錄目前模型狀態 (16 層 KV cache + 48 層 linear attention state) **實際已送入**的 token 序列 (prompt + 已生成並回饋的 token)。
+* 新請求若 `kv_cache_ids` 完整為新 prompt 的開頭，且至少還有 1 個新 token，就不 `reset_state()`，只從該位置繼續分段預填充 (position ids / attention mask 接續)。
+* **linear attention state 無法回退**，因此只要有任何不一致 (換對話、改寫歷史、超過 16k 被裁剪、重送相同 prompt) 就整段重來，以正確性優先。
+* 產生器在 `finally` 更新 `kv_cache_ids`；串流與非串流都在持有 `infer_lock` 期間 `close()`，客戶端中斷也不會讓記錄與狀態錯位；推論失敗則清空記錄。
+* 單 token 的 stop (含 EOS) 不會送入模型，下一輪可沿用；跨多 token 的 stop 字串 (如 `</think>`) 前段已送入但不在回答中，下一輪自動判定不一致而重設。
+* 順帶修正：跨 token 的 stop 字串前段不再提早送給客戶端 (暫緩可能是 stop 開頭的文字)。
+* `PREFIX_CACHE=0` 環境變數可關閉；回應 `usage.prompt_tokens_details.cached_tokens` 顯示沿用數量。
+
+### 2. 實測
+| 測試 | 無 prefix caching | 自製 + prefix caching | OVMS |
+|---|---|---|---|
+| 長文 2639 tokens 第 1 輪 | 250s | 246s | 300s |
+| 第 2 / 3 / 4 輪 (各新增約 25 tokens) | ~250s / 輪 | **5s / 5s / 5s** (沿用 2641→2697 tokens，答案 84/1050/616 全對) | 5s |
+| 工具結果回傳 (462 tokens，沿用 413) | 105s | **68s** | 56s |
+
+* 限制：只保留一段對話；工具呼叫第 1、2 步 prompt 相同但狀態已含第 1 步輸出，第 2 步會重設 (正確行為)。
+

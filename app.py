@@ -42,7 +42,7 @@ with st.sidebar:
     backend_name = st.radio(
         "後端伺服器",
         list(BACKENDS.keys()),
-        help="OVMS 支援 prefix caching，多輪對話不需重新預填充整段歷史，速度快很多"
+        help="兩者皆支援 prefix caching 與工具呼叫；OVMS 可同時快取多段對話，自製伺服器只保留最近一段"
     )
     backend = BACKENDS[backend_name]
     is_ovms = backend["base_url"].endswith("/v3")
@@ -61,7 +61,7 @@ with st.sidebar:
     st.info("💻 運算設備：Intel Iris Xe (已配置 Priority.LOW 保護螢幕不閃爍)")
 
     max_tokens = st.slider("最大輸出長度 (Max Tokens)", 64, 4096, 512, step=64)
-    history_turns = st.slider("歷史對話保留輪數", 1, 50, 10, step=1, help="送入伺服器的對話輪數；上下文上限約 16k。自製伺服器每輪都重新預填充 (約 10 tokens/s)，OVMS 有 prefix caching 只需處理新訊息")
+    history_turns = st.slider("歷史對話保留輪數", 1, 50, 10, step=1, help="送入伺服器的對話輪數；上下文上限約 16k。兩種後端都有 prefix caching，接續同一段對話時只需預填充新訊息 (約 10 tokens/s)")
     temperature = st.slider("溫度 (Temperature)", 0.0, 1.5, 0.7, step=0.1)
     top_p = st.slider("Top P", 0.1, 1.0, 0.9, step=0.05)
     enable_thinking = st.checkbox("啟用深層思考 (<think> 模式)", value=False)

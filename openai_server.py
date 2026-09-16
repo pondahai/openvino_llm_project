@@ -38,6 +38,8 @@ MODEL_NAME = "qwen3.8-27b-int4-ov"
 MAX_CONTEXT_TOKENS = 16384
 # 分段預填充：每段 token 數，確保單次 GPU 推論遠低於 Windows TDR 2 秒門檻
 PREFILL_CHUNK_TOKENS = int(os.environ.get("PREFILL_CHUNK_TOKENS", "128"))
+# Prefix caching：多輪對話沿用上一個請求的模型狀態，只預填充新增的 token (PREFIX_CACHE=0 可關閉)
+ENABLE_PREFIX_CACHE = os.environ.get("PREFIX_CACHE", "1") != "0"
 
 STOP_TOKEN_IDS = {248046, 248044, 248045, 151643, 151645}
 
@@ -83,6 +85,8 @@ c_lm = core.compile_model(os.path.join(MODEL_DIR, "openvino_language_model.xml")
 infer_req = c_lm.create_infer_request()
 # 全域只有一個 infer_req (KV cache 狀態)，同一時間只能服務一個請求
 infer_lock = asyncio.Lock()
+# 目前模型狀態 (KV cache 與 linear attention state) 所對應的 token 序列
+kv_cache_ids: List[int] = []
 print("🎉 模型參數載入完畢！API 伺服器就緒。\n")
 
 # Pydantic 數據結構嚴格相容 OpenAI
@@ -287,70 +291,107 @@ def partial_tag_len(text: str, tag: str) -> int:
             return n
     return 0
 
+def common_prefix_len(a: List[int], b: List[int]) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
 def generate_text(input_ids: np.ndarray, max_steps: int, temperature, top_p, user_stops: List[str], stats: Dict[str, int]):
-    """同步產生器 (呼叫端須持有 infer_lock)：逐步 yield (文字片段, finish_reason 或 None)"""
-    seq_len = input_ids.shape[1]
+    """同步產生器 (呼叫端須持有 infer_lock，結束後必須 close())：逐步 yield (文字片段, finish_reason 或 None)"""
+    global kv_cache_ids
+    ids = input_ids[0].tolist()
+    seq_len = len(ids)
     b_idx = np.zeros((1,), dtype=np.int32)
 
-    # 分段預填充：除最後一段外逐段送入 GPU 累積 KV cache，最後一段留給生成迴圈的第一次 infer 以取得 logits
+    # Prefix caching：linear attention 狀態無法回退，只有上次處理過的完整序列是本次 prompt 的開頭時才能沿用；
+    # 至少需留 1 個新 token 以取得 logits
+    reuse = common_prefix_len(kv_cache_ids, ids) if ENABLE_PREFIX_CACHE else 0
+    if reuse != len(kv_cache_ids) or reuse >= seq_len:
+        reuse = 0
+    stats["cached_tokens"] = reuse
+    kv_cache_ids = []          # 狀態即將變動，完成前先視為無效
+    fed: List[int] = ids[:reuse]   # 已送入模型 (存在於 KV cache / linear state) 的 token
+
     try:
-        infer_req.reset_state()
-        last_start = ((seq_len - 1) // PREFILL_CHUNK_TOKENS) * PREFILL_CHUNK_TOKENS
-        for start in range(0, seq_len, PREFILL_CHUNK_TOKENS):
-            end = min(start + PREFILL_CHUNK_TOKENS, seq_len)
-            cur_embeds = c_embed([input_ids[:, start:end]])[c_embed.outputs[0]]
-            cur_mask = np.ones((1, end), dtype=np.int64)
-            cur_pos = np.tile(np.arange(start, end, dtype=np.int64), (4, 1, 1))
-            if start == last_start:
-                break
-            infer_req.infer({
-                "inputs_embeds": cur_embeds,
-                "attention_mask": cur_mask,
-                "position_ids": cur_pos,
-                "beam_idx": b_idx
-            })
-    except Exception as e:
-        yield f"\n\n[系統錯誤: 預填充失敗 - {e}]", "error"
-        return
-    if seq_len > PREFILL_CHUNK_TOKENS:
-        print(f"🧩 分段預填充完成: {seq_len} tokens / 每段 {PREFILL_CHUNK_TOKENS}")
-
-    decoder = IncrementalDecoder()
-    text = ""
-    emitted = 0
-    for _ in range(max_steps):
+        # 分段預填充：除最後一段外逐段送入 GPU 累積狀態，最後一段留給生成迴圈的第一次 infer 以取得 logits
         try:
-            infer_req.infer({
-                "inputs_embeds": cur_embeds,
-                "attention_mask": cur_mask,
-                "position_ids": cur_pos,
-                "beam_idx": b_idx
-            })
+            if reuse == 0:
+                infer_req.reset_state()
+            last_start = reuse + ((seq_len - reuse - 1) // PREFILL_CHUNK_TOKENS) * PREFILL_CHUNK_TOKENS
+            for start in range(reuse, seq_len, PREFILL_CHUNK_TOKENS):
+                end = min(start + PREFILL_CHUNK_TOKENS, seq_len)
+                cur_embeds = c_embed([input_ids[:, start:end]])[c_embed.outputs[0]]
+                cur_mask = np.ones((1, end), dtype=np.int64)
+                cur_pos = np.tile(np.arange(start, end, dtype=np.int64), (4, 1, 1))
+                pending_ids = ids[start:end]
+                if start == last_start:
+                    break
+                infer_req.infer({
+                    "inputs_embeds": cur_embeds,
+                    "attention_mask": cur_mask,
+                    "position_ids": cur_pos,
+                    "beam_idx": b_idx
+                })
+                fed += pending_ids
         except Exception as e:
-            yield f"\n\n[系統錯誤: 推論記憶體超限 - {e}]", "error"
+            fed = []
+            yield f"\n\n[系統錯誤: 預填充失敗 - {e}]", "error"
             return
+        if reuse:
+            print(f"♻️ Prefix cache 命中: 沿用 {reuse} tokens，新增預填充 {seq_len - reuse} tokens")
+        elif seq_len > PREFILL_CHUNK_TOKENS:
+            print(f"🧩 分段預填充完成: {seq_len} tokens / 每段 {PREFILL_CHUNK_TOKENS}")
 
-        logits = infer_req.get_output_tensor(0).data
-        next_token = sample_token(logits[0, -1, :], temperature, top_p)
-        if next_token in STOP_TOKEN_IDS:
-            yield decoder.flush(), "stop"
-            return
-        stats["completion_tokens"] += 1
+        decoder = IncrementalDecoder()
+        stop_strings = list(SPECIAL_TAGS) + user_stops
+        text = ""
+        emitted = 0
+        for _ in range(max_steps):
+            try:
+                infer_req.infer({
+                    "inputs_embeds": cur_embeds,
+                    "attention_mask": cur_mask,
+                    "position_ids": cur_pos,
+                    "beam_idx": b_idx
+                })
+            except Exception as e:
+                fed = []
+                yield f"\n\n[系統錯誤: 推論記憶體超限 - {e}]", "error"
+                return
+            fed += pending_ids
 
-        text += decoder.add(next_token)
-        # 特殊標籤與使用者 stop 字串：截在最早出現的位置
-        hits = [i for i in (text.find(t) for t in list(SPECIAL_TAGS) + user_stops) if i >= 0]
-        if hits:
-            yield text[emitted:max(min(hits), emitted)], "stop"
-            return
-        yield text[emitted:], None
-        emitted = len(text)
+            logits = infer_req.get_output_tensor(0).data
+            next_token = sample_token(logits[0, -1, :], temperature, top_p)
+            if next_token in STOP_TOKEN_IDS:
+                yield text[emitted:] + decoder.flush(), "stop"
+                return
+            stats["completion_tokens"] += 1
 
-        cur_embeds = c_embed([np.array([[next_token]], dtype=np.int64)])[c_embed.outputs[0]]
-        cur_mask = np.ones((1, cur_mask.shape[1] + 1), dtype=np.int64)
-        cur_pos = np.full((4, 1, 1), cur_mask.shape[1] - 1, dtype=np.int64)
+            text += decoder.add(next_token)
+            # 特殊標籤與使用者 stop 字串：截在最早出現的位置
+            hits = [i for i in (text.find(t) for t in stop_strings) if i >= 0]
+            if hits:
+                yield text[emitted:max(min(hits), emitted)], "stop"
+                return
+            # 結尾可能是跨 token 的 stop 字串開頭，先暫緩輸出
+            safe = len(text) - max(partial_tag_len(text, t) for t in stop_strings)
+            if safe > emitted:
+                yield text[emitted:safe], None
+                emitted = safe
+            else:
+                yield "", None
 
-    yield decoder.flush(), "length"
+            cur_embeds = c_embed([np.array([[next_token]], dtype=np.int64)])[c_embed.outputs[0]]
+            cur_mask = np.ones((1, cur_mask.shape[1] + 1), dtype=np.int64)
+            cur_pos = np.full((4, 1, 1), cur_mask.shape[1] - 1, dtype=np.int64)
+            pending_ids = [next_token]
+
+        yield text[emitted:] + decoder.flush(), "length"
+    finally:
+        # 記錄模型狀態實際包含的 token，供下一個請求比對
+        kv_cache_ids = fed
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
@@ -372,7 +413,7 @@ async def chat_completions(req: ChatCompletionRequest):
     parse_tools = bool(req.tools)
 
     def run_generation():
-        stats = {"completion_tokens": 0}
+        stats = {"completion_tokens": 0, "cached_tokens": 0}
         return generate_text(input_ids, max_steps, req.temperature, req.top_p, user_stops, stats), stats
 
     # --- 1. 標準 SSE 串流協議 (OpenAI Streaming) ---
@@ -401,29 +442,33 @@ async def chat_completions(req: ChatCompletionRequest):
                 pending = ""       # 暫緩送出、可能是 <tool_call> 開頭的文字
                 tool_start = -1    # full_text 中 <tool_call> 的位置
                 finish_reason = "length"
-                while True:
-                    item = await run_in_threadpool(next, gen, None)
-                    if item is None:
-                        break
-                    delta, finish = item
-                    full_text += delta
-                    if tool_start < 0 and delta:
-                        if parse_tools:
-                            pending += delta
-                            idx = pending.find(TOOL_CALL_OPEN)
-                            if idx >= 0:
-                                tool_start = len(full_text) - len(pending) + idx
-                                out, pending = pending[:idx], ""
+                try:
+                    while True:
+                        item = await run_in_threadpool(next, gen, None)
+                        if item is None:
+                            break
+                        delta, finish = item
+                        full_text += delta
+                        if tool_start < 0 and delta:
+                            if parse_tools:
+                                pending += delta
+                                idx = pending.find(TOOL_CALL_OPEN)
+                                if idx >= 0:
+                                    tool_start = len(full_text) - len(pending) + idx
+                                    out, pending = pending[:idx], ""
+                                else:
+                                    keep = partial_tag_len(pending, TOOL_CALL_OPEN)
+                                    out, pending = pending[:len(pending) - keep], pending[len(pending) - keep:]
                             else:
-                                keep = partial_tag_len(pending, TOOL_CALL_OPEN)
-                                out, pending = pending[:len(pending) - keep], pending[len(pending) - keep:]
-                        else:
-                            out = delta
-                        if out:
-                            yield make_chunk({"content": out})
-                    if finish:
-                        finish_reason = finish
-                        break
+                                out = delta
+                            if out:
+                                yield make_chunk({"content": out})
+                        if finish:
+                            finish_reason = finish
+                            break
+                finally:
+                    # 在持有鎖期間關閉產生器 (含客戶端中斷)，確保 kv_cache_ids 與模型狀態一致
+                    gen.close()
 
                 if tool_start >= 0:
                     _, calls = parse_tool_calls(full_text[tool_start:], req.tools)
@@ -445,15 +490,19 @@ async def chat_completions(req: ChatCompletionRequest):
     def generate_all():
         gen, stats = run_generation()
         parts, finish_reason = [], "length"
-        for delta, finish in gen:
-            parts.append(delta)
-            if finish:
-                finish_reason = finish
-                break
-        return "".join(parts), finish_reason, stats["completion_tokens"]
+        try:
+            for delta, finish in gen:
+                parts.append(delta)
+                if finish:
+                    finish_reason = finish
+                    break
+        finally:
+            gen.close()
+        return "".join(parts), finish_reason, stats
 
     async with infer_lock:
-        content_str, finish_reason, completion_tokens = await run_in_threadpool(generate_all)
+        content_str, finish_reason, stats = await run_in_threadpool(generate_all)
+    completion_tokens = stats["completion_tokens"]
 
     message: Dict[str, Any] = {"role": "assistant", "content": content_str}
     if parse_tools:
@@ -479,7 +528,8 @@ async def chat_completions(req: ChatCompletionRequest):
         "usage": {
             "prompt_tokens": seq_len,
             "completion_tokens": completion_tokens,
-            "total_tokens": seq_len + completion_tokens
+            "total_tokens": seq_len + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": stats["cached_tokens"]}
         }
     }
 
