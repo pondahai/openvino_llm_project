@@ -97,7 +97,16 @@ class ChatCompletionRequest(BaseModel):
 
 def render_prompt(req: ChatCompletionRequest) -> str:
     msgs_data = []
-    for m in req.messages:
+    # 為避免 Intel Iris Xe 內顯在 Prefill 階段超過 Windows 2秒 TDR 逾時門檻 (引發螢幕閃爍與 OpenCL -14)
+    # 保留 System 提示詞，對話歷史採取滑動窗口機制 (只保留最近 1-2 輪，最多約 3 則訊息)
+    system_msgs = [m for m in req.messages if m.role == "system"]
+    conversation_msgs = [m for m in req.messages if m.role != "system"]
+    
+    # 取最近 2 則訊息 (例如上一輪 Assistant 與當前 User)
+    truncated_conv = conversation_msgs[-2:] if len(conversation_msgs) > 2 else conversation_msgs
+    active_msgs = system_msgs + truncated_conv
+
+    for m in active_msgs:
         item = {"role": m.role, "content": m.content if isinstance(m.content, str) else str(m.content)}
         if m.tool_calls:
             normalized_tool_calls = []
@@ -188,6 +197,12 @@ async def chat_completions(req: ChatCompletionRequest):
     # 輸入編碼
     tok_res = c_tok([formatted_prompt])
     input_ids = tok_res["input_ids"]
+    
+    # 內顯安全防護：若 Prompt 超過 200 tokens，截取最近 200 tokens，防止 Prefill 超過 2 秒引發 Windows TDR 斷線
+    MAX_PROMPT_TOKENS = 200
+    if input_ids.shape[1] > MAX_PROMPT_TOKENS:
+        input_ids = input_ids[:, -MAX_PROMPT_TOKENS:]
+        
     seq_len = input_ids.shape[1]
     
     embed_res = c_embed([input_ids])

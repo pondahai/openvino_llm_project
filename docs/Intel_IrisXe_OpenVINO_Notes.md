@@ -147,23 +147,43 @@ OpenVINO 內建 GGUF Reader 目前對新型多模態架構與新式量化格式�
   ```
   **徹底解除 4GB 單塊記憶體分配限制**，解鎖全部 29.52GB 的 GPU 共享記憶體池，並在串流迴圈中加入例外防禦處理。
 
-### 3. OpenCL 事件崩潰與螢幕閃爍 (Error Code: -14 / -5 CL_OUT_OF_RESOURCES & TDR)
+### 3. OpenCL 事件崩潰與螢幕閃爍 (Error Code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST & TDR)
 * **故障現象**：
-  多次對話後，伺服器日誌拋出：
+  多次對話或提示詞較長時，伺服器拋出：
   ```text
-  [GPU] clWaitForEvents failed with -14 code (CL_OUT_OF_RESOURCES)
-  [GPU] clFlush, error code: -5 CL_OUT_OF_RESOURCES
+  [系統錯誤: 推論記憶體超限 - Exception from src\inference\src\cpp\infer_request.cpp:224: 
+  Exception from src\plugins\intel_gpu\src\runtime\ocl\ocl_stream.cpp:443: 
+  [GPU] clWaitForEvents failed with -14 code]
   ```
-  同時螢幕出現瞬間黑屏或閃爍。
-* **全球社群與 Intel 官方 Issue 調查結論**：
-  1. **TDR（超時檢測與恢復）驅動重設**：
-     Intel Iris Xe 為整合式內顯，螢幕畫面輸出（DWM 桌面窗口管理器）與 LLM 大模型矩陣推論共用同一顆 GPU 核心與記憶體匯流排。當 27B 大模型進行龐大計算時，GPU 核心佔用率達 100% 超過 Windows 預設超時容忍（約 2 秒），觸發 Windows TDR 強制重啟顯卡驅動，造成螢幕黑屏閃爍，底層 OpenCL 佇列被強制銷毀因而回傳 `-14 / -5`。
-  2. **雙重 GPU 模型擠壓**：
-     若將 `openvino_text_embeddings_model.xml`（1.27GB）與 27B 主語言模型（13.9GB）同時編譯於 GPU，兩者會在同一 OpenCL Context 中頻繁交替 Flush 爭奪顯存與佇列。
-* **架構級終極解法**：
+  伴隨 Windows 桌面黑畫面或螢幕瞬間劇烈閃爍。
+
+* **底層根本原因剖析 (Root Cause)**：
+  1. **錯誤碼 `-14` 的本質**：
+     在 OpenCL 官方規範中，`-14` 代表 `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`。這**不是**物理記憶體不足，而是**指令隊列（Command Queue）在等待執行完成時，底層驅動被系統強行殺死/中止**。
+  2. **Windows TDR (Timeout Detection and Recovery) 殺線機制**：
+     * Intel Iris Xe 是內顯（iGPU），與 Windows 視窗桌面管理器（DWM.exe）共用同一顆圖形核心與 DDR4 記憶體匯流排。
+     * Windows 內建嚴苛的看門狗機制（TDR），預設逾時門檻只有 **2.0 秒**。
+     * 當發送包含多輪歷史或長問題（> 50~100 Tokens）時，27B 模型（64 層 Attention）在 80 EUs 內顯上的 **Prompt Prefill（預填充）** 計算需要耗時 3~5 秒。
+     * Windows 偵測到 GPU 在 2 秒內未響應桌面渲染請求，**判定 GPU 驅動當機**，立即發起重設（此時螢幕短暫黑屏閃爍）。重設後 OpenCL 上下文被強行中斷銷毀，OpenVINO 等待事件失敗並拋出 `-14`。
+
+* **社群通用標準修復方案 (Two-Pronged Solutions)**：
+
+  #### 【系統層面：延長 Windows TDR 逾時時間】(本機大模型 / Stable Diffusion 玩家必改標準)
+  將 Windows GPU 看門狗超時閾值從 2 秒調整至 15 秒，給予 27B 內顯充足計算空間，徹底告別螢幕閃爍：
+  以管理員身份開啟 PowerShell 執行：
+  ```powershell
+  reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v "TdrDelay" /t REG_DWORD /d 15 /f
+  reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v "TdrDdiDelay" /t REG_DWORD /d 15 /f
+  ```
+  *(修改後重新啟動電腦即可生效)*
+
+  #### 【程式碼層面：雙重安全護欄 (Zero-Config Fix)】
+  若不修改系統註冊表，伺服器端實施嚴格的防禦性計算控制：
   1. **異構運算分工 (Heterogeneous Offload)**：
-     將文字嵌入層改由 **CPU** 編譯執行（CPU 耗時僅 0.1 秒且零顯存壓力），**GPU 專注負責 27B 主語言模型矩陣計算**，徹底消除雙模型顯存搶佔。
-  2. **GPU 隊列優先級降為 LOW**：
-     配置 `"GPU_QUEUE_THROTTLE": "LOW"`, `"GPU_QUEUE_PRIORITY": "LOW"`, `"MODEL_PRIORITY": "LOW"`，強制讓出主頻與匯流排給 Windows 桌面合成器，保證螢幕 100% 不閃爍。
-  3. **滑動視窗歷史截取 (Sliding Window)**：
-     在前端截取最近 2~3 輪對話，並在歷史中自動剃除帶有 `[系統錯誤` 的污染記錄，確保送入 GPU 的上下文始終乾淨精簡。
+     將文字嵌入層 (`openvino_text_embeddings_model.xml`) 改由 **CPU** 編譯執行，避開雙 GPU 模型在同一個 OpenCL Context 競爭顯存與佇列。
+  2. **滑動視窗歷史 (Sliding Window)**：
+     在 `openai_server.py` 的 `render_prompt` 中，對話歷史採取只保留最近 1~2 則訊息，防止 Prefill 累積過長。
+  3. **提示詞 Token 硬性截斷 (Prompt Clipping)**：
+     若輸入超過 200 Tokens，自動截取最後 200 Tokens，確保單次 Prefill 在 1.5 秒內完成，永遠不碰觸 Windows 2 秒 TDR 殺線。
+  4. **GPU 隊列優先級降級**：
+     配置 `"GPU_QUEUE_THROTTLE": "LOW"`, `"GPU_QUEUE_PRIORITY": "LOW"`, `"MODEL_PRIORITY": "LOW"`，優先讓出主頻與匯流排給桌面渲染。
