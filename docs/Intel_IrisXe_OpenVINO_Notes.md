@@ -353,7 +353,8 @@ OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI
 * 啟動：`run_api_server.bat qwen3.6-35b-a3b` (API 模型名稱 `qwen3.6-35b-a3b-int4-ov`)；`LLM_DEVICE` 可覆寫裝置。
 * **Prefix caching 修正**：Qwen3.6 模板預設 (`preserve_thinking` 未設定) 會刪除歷史回答的 `<think>` 區塊，但這些 token 已送入模型，導致每輪都判定不一致而整段重算 (第 2、3 輪各約 200 秒)。伺服器改為一律傳 `preserve_thinking=True`；27B 模板本來就預設保留，行為不變。
 * 多輪長文 (約 2,500 tokens，後續每輪新增約 33 tokens)：第 1 輪 192 秒，**第 2 / 3 輪 3.1 / 2.9 秒** (沿用 2,511 / 2,548 tokens)，答案 84 / 4550 / 231 全對；工具呼叫 ✅。
-* 已知限制：串流回應不回傳 `usage`；只讀取最上層的 `enable_thinking`，不讀 `chat_template_kwargs`。
+* 串流 `usage`：請求帶 `stream_options: {"include_usage": true}` 時，依 OpenAI 規格在 `[DONE]` 前多送一個 `choices` 為空陣列、含 `usage` (含 `cached_tokens`) 的 chunk (2026-09-17 修正，原本串流不回傳)。
+* 已知限制：只讀取最上層的 `enable_thinking`，不讀 `chat_template_kwargs`。
 
 ### 6. HETERO (GPU + CPU 分工) 失敗
 * `--target_device HETERO:GPU,CPU` 搭配 `MODEL_DISTRIBUTION_POLICY: PIPELINE_PARALLEL`，自動分配仍把過多層放上 GPU，編譯時出現同樣的 `Can not allocate 536870912 bytes for USM Device`。

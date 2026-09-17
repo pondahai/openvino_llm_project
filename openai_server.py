@@ -114,6 +114,8 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
     stream: Optional[bool] = False
+    # {"include_usage": true}：串流結束前多送一個只含 usage 的 chunk
+    stream_options: Optional[Dict[str, Any]] = None
     stop: Optional[Union[str, List[str]]] = None
     tools: Optional[List[Dict[str, Any]]] = None
     enable_thinking: Optional[bool] = False
@@ -430,28 +432,42 @@ async def chat_completions(req: ChatCompletionRequest):
         stats = {"completion_tokens": 0, "cached_tokens": 0}
         return generate_text(input_ids, max_steps, req.temperature, req.top_p, user_stops, stats), stats
 
+    def make_usage(stats: Dict[str, int]) -> Dict[str, Any]:
+        return {
+            "prompt_tokens": seq_len,
+            "completion_tokens": stats["completion_tokens"],
+            "total_tokens": seq_len + stats["completion_tokens"],
+            "prompt_tokens_details": {"cached_tokens": stats["cached_tokens"]}
+        }
+
     # --- 1. 標準 SSE 串流協議 (OpenAI Streaming) ---
     if req.stream:
-        def make_chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
-            chunk = {
+        include_usage = bool((req.stream_options or {}).get("include_usage"))
+
+        def make_chunk(delta: Optional[Dict[str, Any]], finish_reason: Optional[str] = None,
+                       usage: Optional[Dict[str, Any]] = None) -> str:
+            chunk: Dict[str, Any] = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
                 "created": created_ts,
                 "model": MODEL_NAME,
                 "system_fingerprint": "fp_openvino_irisxe",
-                "choices": [{
+                # delta 為 None 時是 include_usage 的最後一個 chunk，choices 依規格為空陣列
+                "choices": [] if delta is None else [{
                     "index": 0,
                     "delta": delta,
                     "logprobs": None,
                     "finish_reason": finish_reason
                 }]
             }
+            if include_usage:
+                chunk["usage"] = usage
             return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         async def openai_sse_generator():
             async with infer_lock:
                 yield make_chunk({"role": "assistant", "content": ""})
-                gen, _ = run_generation()
+                gen, stats = run_generation()
                 full_text = ""
                 pending = ""       # 暫緩送出、可能是 <tool_call> 開頭的文字
                 tool_start = -1    # full_text 中 <tool_call> 的位置
@@ -496,6 +512,8 @@ async def chat_completions(req: ChatCompletionRequest):
                     yield make_chunk({"content": pending})
 
                 yield make_chunk({}, finish_reason)
+                if include_usage:
+                    yield make_chunk(None, usage=make_usage(stats))
                 yield "data: [DONE]\n\n"
 
         return StreamingResponse(openai_sse_generator(), media_type="text/event-stream")
@@ -516,7 +534,6 @@ async def chat_completions(req: ChatCompletionRequest):
 
     async with infer_lock:
         content_str, finish_reason, stats = await run_in_threadpool(generate_all)
-    completion_tokens = stats["completion_tokens"]
 
     message: Dict[str, Any] = {"role": "assistant", "content": content_str}
     if parse_tools:
@@ -539,12 +556,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 "finish_reason": finish_reason
             }
         ],
-        "usage": {
-            "prompt_tokens": seq_len,
-            "completion_tokens": completion_tokens,
-            "total_tokens": seq_len + completion_tokens,
-            "prompt_tokens_details": {"cached_tokens": stats["cached_tokens"]}
-        }
+        "usage": make_usage(stats)
     }
 
 if __name__ == "__main__":
