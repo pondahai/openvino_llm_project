@@ -336,3 +336,17 @@ OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI
 
 * 結論：MoE 每個 token 只啟用約 3B 參數，CPU 生成速度約為 27B GPU 的兩倍，但預填充較慢，長文首字延遲會更明顯 (未測)。
 * 兩個模型都使用 port 8000 且記憶體不足以同時載入，一次只能執行一個。
+
+### 4. 長文首字延遲 (CPU)
+| Prompt 長度 | 首字延遲 | 預填充速度 | 答案 |
+| :--- | :--- | :--- | :--- |
+| 471 tokens | 77 秒 | 6.1 tok/s | ✅ |
+| 1,149 tokens | 168 秒 | 6.9 tok/s | ✅ |
+| 2,509 tokens | **368 秒** | 6.8 tok/s | ✅ |
+
+* CPU 預填充固定約 6.5 ~ 7 tok/s，首字延遲隨長度線性增加；27B GPU 處理 2,639 tokens 約 250 秒 (約 10.5 tok/s)，生成較慢但讀長文較快。
+* ⚠️ 間歇性卡住：另一份約 2,650 tokens 的多輪測試 prompt 兩次都超過 10 ~ 20 分鐘沒有第一個字，log 每約 6.5 分鐘出現一次 scheduler 紀錄、cache 使用率固定 3.1%；同長度的上表測試卻正常完成。原因未確認，因此多輪 prefix caching 在此模型上尚未驗證。
+
+### 5. HETERO (GPU + CPU 分工) 失敗
+* `--target_device HETERO:GPU,CPU` 搭配 `MODEL_DISTRIBUTION_POLICY: PIPELINE_PARALLEL`，自動分配仍把過多層放上 GPU，編譯時出現同樣的 `Can not allocate 536870912 bytes for USM Device`。
+* OVMS 無法手動指定各層的裝置，故放棄；即使成功，CPU 與 GPU 共用同一組 DDR4，生成速度仍受頻寬限制，主要只可能改善預填充。
