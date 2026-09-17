@@ -128,3 +128,26 @@ Intel 官方確實推出了自家的桌上型軟體 **Intel AI Playground**，�
 * 開發 `openai_server.py`，監聽 `http://127.0.0.1:1234/v1`。
 * 實作標準的 **Server-Sent Events (SSE) 串流協定**（發送 `data: {...}\n\n` 與 `data: [DONE]\n\n`）。
 * 透過官方 `openai` Python SDK 測試呼叫成功，正式成為可供 Agent 系統無縫調用的本地大腦！
+
+---
+
+## 🕒 第八階段：部署 MoE 模型 Qwen3.6-35B-A3B (2026-09-17)
+
+### 1. 下載
+* 官方轉換版 `OpenVINO/Qwen3.6-35B-A3B-int4-ov` 約 19.7 GB (語言模型 18.65 GB)。
+* **踩坑**：`huggingface_hub` 預設的 Xet 下載方式卡住不動；設定 `HF_HUB_DISABLE_XET=1` 改走 HTTP 後正常，約 2 小時 40 分完成。
+
+### 2. GPU 放不下，改用 CPU
+* 權重比 27B 還小，但 GPU 編譯時超出 Iris Xe 約 29.5 GB 的共享記憶體池 (`Can not allocate 536870912 bytes for USM Device`)。
+* 改用 CPU：每個 token 只啟用約 3B 參數，生成約 **4 tokens/s**，是 27B GPU 的兩倍。
+
+### 3. OVMS vs 自製伺服器
+* OVMS (CPU) 長文預填充約 6.8 tokens/s，2,500 tokens 首字延遲 368 秒。
+* 讓 `openai_server.py` 支援選模型與裝置 (`LLM_MODEL` / `LLM_DEVICE`)，CPU 分段預填充 512 tokens：同長度只要 **196 秒**，快過 27B GPU 的約 250 秒。
+* **踩坑**：Qwen3.6 對話模板重新渲染歷史時預設刪除 `<think>` 區塊，與已送入模型的 token 對不上，prefix caching 每輪失效；伺服器改為固定傳 `preserve_thinking=True` 後，多輪後續問題從約 200 秒降到 **約 3 秒**。
+* 另修正自製伺服器串流不回傳 `usage`、不讀 `chat_template_kwargs.enable_thinking` 兩個相容性問題。
+
+### 4. CPU + GPU 分工的嘗試 (失敗)
+* OVMS 的 `HETERO:GPU,CPU` 自動分配仍把太多層放上 GPU 而記憶體不足。
+* 自製伺服器手動指定各層裝置：GPU 編譯時權重膨脹約 10 倍 (1.69 GB 權重佔用 17.3 GB)；狀態節點放 GPU 會讓 GPU plugin 崩潰，放 CPU 又無法編譯。
+* **結論**：本機跑此模型的最佳方案是自製伺服器全 CPU 執行。詳細數據見研究筆記第十二節。

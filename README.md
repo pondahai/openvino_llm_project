@@ -79,6 +79,8 @@ OVMS 為 Intel 官方推論伺服器，內建工具呼叫解析與 **prefix cach
 .\start_ovms.ps1 -OvmsDir C:\path\to\ovms
 ```
 3. API 位址為 `http://127.0.0.1:8000/v3`，模型名稱 `qwen3.8-27b-ovms`；GUI 側邊欄可切換後端。
+   * 改用 Qwen3.6-35B-A3B：`.\start_ovms.ps1 -Model qwen3.6-35b-a3b` (模型名稱 `qwen3.6-35b-a3b-ovms`)，預設以 CPU 執行 (GPU 記憶體池放不下)；`-Device GPU|CPU` 可手動指定。兩個模型無法同時執行。
+   * 此模型用自製伺服器的長文首字延遲約為 OVMS 的一半 (2,500 tokens：196 秒 vs 368 秒)，建議改用上方第 3 點的自製伺服器。
 4. 關閉思考模式時請在請求加上 `stop: ["</think>"]` (模型偶爾在回答後輸出 `</think>` 並重複回答)：
 ```python
 client = OpenAI(base_url="http://127.0.0.1:8000/v3", api_key="not-needed")
@@ -103,6 +105,7 @@ client.chat.completions.create(
 * 驗證「能否共用 LM Studio 的 GGUF 模型」與相容性掃描失敗原因
 * Intel AI Playground 的限制、突破下載限速、Qwen3.8-27B 首次實測
 * ChatML 對話模板演進與 OpenAI 相容 Agent Server 的誕生
+* 部署 MoE 模型 Qwen3.6-35B-A3B：GPU 放不下改用 CPU、OVMS vs 自製伺服器、CPU + GPU 分工的失敗嘗試
 
 ### 2. [🧪 推論測試計畫與首發成果](docs/Qwen3.8_27B_IrisXe_Test_Plan.md)
 * 測試目標、環境基準、指標 (TTFT / TPS / 記憶體) 與三種 Prompt 情境
@@ -134,7 +137,7 @@ client.chat.completions.create(
 openvino_llm_project/
 │
 ├── app.py                     # Streamlit 網頁互動對話介面 (支援串流打字機效果)
-├── openai_server.py           # 相容 OpenAI API (Port 1234) 之微服務
+├── openai_server.py           # 相容 OpenAI API (Port 1234) 之微服務 (LLM_MODEL / LLM_DEVICE 選模型與裝置)
 ├── test_openai_client.py      # OpenAI 官方 SDK 測試腳本
 ├── run_benchmark.py           # 原生 OpenVINO 推論效能基準測試
 ├── native_infer_qwen27b.py    # 終端機純 Python 推論測試腳本
@@ -143,7 +146,7 @@ openvino_llm_project/
 ├── run_gui.bat                # 一鍵啟動 GUI 對話介面批次檔
 ├── run_api_server.bat         # 一鍵啟動 API 伺服器批次檔
 ├── run_ovms.bat               # 一鍵啟動 OVMS 批次檔
-├── start_ovms.ps1             # OVMS 啟動參數 (VLM_CB / GPU / prefix caching)
+├── start_ovms.ps1             # OVMS 啟動參數 (-Model / -Device、VLM_CB、prefix caching)
 ├── .gitignore                 # Git 忽略設定 (排除巨大權重與快取)
 └── docs/                      # 開發筆記、理論推導與測試報告
     ├── Intel_IrisXe_OpenVINO_Notes.md    # 核心硬體規格與頻寬理論推導筆記
