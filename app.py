@@ -28,6 +28,11 @@ BACKENDS = {
         "model": "qwen3.8-27b-ovms",
         "launcher": "run_ovms.bat",
     },
+    "OVMS - Qwen3.6-35B-A3B (Port 8000)": {
+        "base_url": "http://127.0.0.1:8000/v3",
+        "model": "qwen3.6-35b-a3b-ovms",
+        "launcher": "run_ovms.bat -Model qwen3.6-35b-a3b",
+    },
 }
 
 # 初始化 OpenAI 客戶端 (依後端快取)

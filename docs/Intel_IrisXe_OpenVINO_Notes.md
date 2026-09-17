@@ -312,3 +312,27 @@ OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI
 
 * 限制：只保留一段對話；工具呼叫第 1、2 步 prompt 相同但狀態已含第 1 步輸出，第 2 步會重設 (正確行為)。
 
+
+---
+
+## 🧩 十二、Qwen3.6-35B-A3B (MoE) 部署實測 (2026-09-17)
+
+### 1. 模型與下載
+* 官方轉換版 `OpenVINO/Qwen3.6-35B-A3B-int4-ov` (架構 `qwen3_5_moe`，含視覺元件)，共約 19.7 GB，其中 `openvino_language_model.bin` 18.65 GB。
+* `huggingface_hub` 1.21 + `hf-xet` 1.6 下載大檔時卡住 (Xet 快取完全不增長)；設定 `HF_HUB_DISABLE_XET=1` 改走 HTTP 後正常，約 1.4 ~ 2.1 MB/s，全程約 2 小時 40 分。
+
+### 2. GPU 載入失敗
+* OVMS weekly 可識別此架構，但 GPU 編譯時失敗：`[GPU] ProgramBuilder build failed!`、`[CL ext] Can not allocate 536870912 bytes for USM Device`。
+* 當時系統 RAM 仍有 57.7 GB 可用，瓶頸是 Iris Xe 共享記憶體池 (約 29.5 GB)，權重 18.65 GB 加上編譯所需空間超出上限。
+
+### 3. 改用 CPU (實測)
+* `start_ovms.ps1 -Model qwen3.6-35b-a3b` 預設 `-Device CPU`，`cache_size 4`，不帶 GPU 專用參數；API 模型名稱 `qwen3.6-35b-a3b-ovms`，約 2.5 分鐘載入完成。
+
+| 項目 | Qwen3.6-35B-A3B (CPU) | Qwen3.8-27B (GPU) |
+| :--- | :--- | :--- |
+| 生成速度 | **約 4.0 tokens/s** | 1.7 ~ 1.9 tokens/s |
+| 首字延遲 (短 prompt) | 7 ~ 13.5 秒 | 約 2.6 秒 |
+| 工具呼叫 (`qwen3coder`) | ✅ `get_weather({"city":"Taipei"})` | ✅ |
+
+* 結論：MoE 每個 token 只啟用約 3B 參數，CPU 生成速度約為 27B GPU 的兩倍，但預填充較慢，長文首字延遲會更明顯 (未測)。
+* 兩個模型都使用 port 8000 且記憶體不足以同時載入，一次只能執行一個。

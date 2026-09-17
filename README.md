@@ -119,6 +119,7 @@ client.chat.completions.create(
 | 九 | 硬體極限分析 (29.5GB GPU 記憶體池、TDR、頻寬)、KV Cache 估算 (為何 128k 不可行)、分段預填充與 16k 上下文 |
 | 十 | OpenVINO Model Server (OVMS) 評估：版本相容性、量化 bug 風險、設定對照與實測比較 |
 | 十一 | 自製伺服器 Prefix Caching 設計與實測 (多輪長文由 ~250 秒降到 5 秒) |
+| 十二 | Qwen3.6-35B-A3B (MoE) 部署：GPU 記憶體池不足、改用 CPU 約 4 tokens/s |
 
 ### 4. [📄 GGUF 相容性掃描原始紀錄](docs/openvino_test_results.txt)
 掃描 LM Studio 模型資料夾 (共 13 個 GGUF 檔) 並以 OpenVINO GenAI 嘗試直接載入的原始輸出，記錄各模型失敗原因 (對應歷程日誌第四階段)。
