@@ -29,15 +29,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_DIR = r"C:\Users\USER\openvino_llm_project\models\Qwen3.8-27B-int4-ov"
-MODEL_NAME = "qwen3.8-27b-int4-ov"
+# 模型選擇 (LLM_MODEL)：(資料夾, API 名稱, 預設裝置)
+# Qwen3.6-35B-A3B 在 GPU 編譯時超出 Iris Xe 共享記憶體池，預設用 CPU
+MODELS = {
+    "qwen3.8-27b": ("Qwen3.8-27B-int4-ov", "qwen3.8-27b-int4-ov", "GPU"),
+    "qwen3.6-35b-a3b": ("Qwen3.6-35B-A3B-int4-ov", "qwen3.6-35b-a3b-int4-ov", "CPU"),
+}
+MODEL_KEY = os.environ.get("LLM_MODEL", "qwen3.8-27b")
+if MODEL_KEY not in MODELS:
+    sys.exit(f"LLM_MODEL 必須是 {list(MODELS)} 之一，目前為 {MODEL_KEY!r}")
+_model_folder, MODEL_NAME, _default_device = MODELS[MODEL_KEY]
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", _model_folder)
+LM_DEVICE = os.environ.get("LLM_DEVICE", _default_device).upper()
 
-# Qwen3.8 官方停止標記與特殊 Token ID
+# Qwen3.8 / Qwen3.6 官方停止標記與特殊 Token ID (兩者 tokenizer 相同)
 # 248046: <|im_end|>, 248044: <|endoftext|>, 248045: <|im_start|>
-# 上下文上限 (prompt + 生成)：16 層 full attention × 4 KV heads × 256 dim，16k tokens 的 KV cache 約 2GB
+# 上下文上限 (prompt + 生成)：27B 為 16 層 full attention × 4 KV heads × 256 dim，16k tokens 的 KV cache 約 2GB
+# (35B-A3B 為 10 層 × 2 KV heads，約 0.6GB)
 MAX_CONTEXT_TOKENS = 16384
-# 分段預填充：每段 token 數，確保單次 GPU 推論遠低於 Windows TDR 2 秒門檻
-PREFILL_CHUNK_TOKENS = int(os.environ.get("PREFILL_CHUNK_TOKENS", "128"))
+# 分段預填充：每段 token 數。GPU 需確保單次推論遠低於 Windows TDR 2 秒門檻；CPU 無此限制，用較大分段
+PREFILL_CHUNK_TOKENS = int(os.environ.get("PREFILL_CHUNK_TOKENS", "128" if LM_DEVICE == "GPU" else "512"))
 # Prefix caching：多輪對話沿用上一個請求的模型狀態，只預填充新增的 token (PREFIX_CACHE=0 可關閉)
 ENABLE_PREFIX_CACHE = os.environ.get("PREFIX_CACHE", "1") != "0"
 
@@ -80,8 +91,8 @@ c_detok = core.compile_model(os.path.join(MODEL_DIR, "openvino_detokenizer.xml")
 print("[2/3] 載入 Text Embeddings 至 CPU (節省 GPU 顯存與輕量化預填充)...")
 c_embed = core.compile_model(os.path.join(MODEL_DIR, "openvino_text_embeddings_model.xml"), "CPU")
 
-print("[3/3] 載入 27B 語言模型至 Intel Iris Xe GPU...")
-c_lm = core.compile_model(os.path.join(MODEL_DIR, "openvino_language_model.xml"), "GPU")
+print(f"[3/3] 載入語言模型 {_model_folder} 至 {LM_DEVICE}...")
+c_lm = core.compile_model(os.path.join(MODEL_DIR, "openvino_language_model.xml"), LM_DEVICE)
 infer_req = c_lm.create_infer_request()
 # 全域只有一個 infer_req (KV cache 狀態)，同一時間只能服務一個請求
 infer_lock = asyncio.Lock()
@@ -139,7 +150,10 @@ def render_prompt(req: ChatCompletionRequest, messages: List[ChatMessage]) -> st
         messages=msgs_data,
         tools=req.tools,
         add_generation_prompt=True,
-        enable_thinking=req.enable_thinking
+        enable_thinking=req.enable_thinking,
+        # 保留歷史回答的 <think> 區塊，使重新渲染的歷史與已送入模型的 token 一致 (prefix caching 才能沿用)
+        # Qwen3.8 模板預設即保留；Qwen3.6 模板預設會刪除，需明確開啟
+        preserve_thinking=True
     )
 
 def build_input_ids(req: ChatCompletionRequest, max_tokens: int) -> np.ndarray:

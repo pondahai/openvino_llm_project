@@ -23,6 +23,11 @@ BACKENDS = {
         "model": "qwen3.8-27b-int4-ov",
         "launcher": "run_api_server.bat",
     },
+    "自製 Server - Qwen3.6-35B-A3B (Port 1234)": {
+        "base_url": "http://127.0.0.1:1234/v1",
+        "model": "qwen3.6-35b-a3b-int4-ov",
+        "launcher": "run_api_server.bat qwen3.6-35b-a3b",
+    },
     "OpenVINO Model Server (Port 8000)": {
         "base_url": "http://127.0.0.1:8000/v3",
         "model": "qwen3.8-27b-ovms",

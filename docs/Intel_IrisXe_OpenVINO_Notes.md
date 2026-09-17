@@ -334,19 +334,27 @@ OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI
 | 首字延遲 (短 prompt) | 7 ~ 13.5 秒 | 約 2.6 秒 |
 | 工具呼叫 (`qwen3coder`) | ✅ `get_weather({"city":"Taipei"})` | ✅ |
 
-* 結論：MoE 每個 token 只啟用約 3B 參數，CPU 生成速度約為 27B GPU 的兩倍，但預填充較慢，長文首字延遲會更明顯 (未測)。
+* 結論：MoE 每個 token 只啟用約 3B 參數，CPU 生成速度約為 27B GPU 的兩倍；長文首字延遲見第 4 點。
 * 兩個模型都使用 port 8000 且記憶體不足以同時載入，一次只能執行一個。
 
-### 4. 長文首字延遲 (CPU)
-| Prompt 長度 | 首字延遲 | 預填充速度 | 答案 |
+### 4. 長文首字延遲 (CPU，OVMS vs 自製伺服器)
+| Prompt 長度 | OVMS 首字延遲 | 自製伺服器首字延遲 | 答案 |
 | :--- | :--- | :--- | :--- |
-| 471 tokens | 77 秒 | 6.1 tok/s | ✅ |
-| 1,149 tokens | 168 秒 | 6.9 tok/s | ✅ |
-| 2,509 tokens | **368 秒** | 6.8 tok/s | ✅ |
+| 約 450 tokens | 77 秒 | (與其他請求重疊，未計) | ✅ |
+| 約 1,130 tokens | 168 秒 | **81 秒** | ✅ |
+| 約 2,500 tokens | 368 秒 | **196 秒** | ✅ |
+| 預填充速度 | 約 6.8 tok/s | **約 13 tok/s** | |
 
-* CPU 預填充固定約 6.5 ~ 7 tok/s，首字延遲隨長度線性增加；27B GPU 處理 2,639 tokens 約 250 秒 (約 10.5 tok/s)，生成較慢但讀長文較快。
-* ⚠️ 間歇性卡住：另一份約 2,650 tokens 的多輪測試 prompt 兩次都超過 10 ~ 20 分鐘沒有第一個字，log 每約 6.5 分鐘出現一次 scheduler 紀錄、cache 使用率固定 3.1%；同長度的上表測試卻正常完成。原因未確認，因此多輪 prefix caching 在此模型上尚未驗證。
+* 首字延遲隨長度線性增加。自製伺服器 (`PREFILL_CHUNK_TOKENS` CPU 預設 512) 約為 OVMS 的兩倍快，也快過 27B GPU (2,639 tokens 約 250 秒)。
+* 更正：先前記錄的「約 2,650 tokens 間歇性卡住」有誤。該測試 prompt 實為約 5,450 tokens，以 OVMS 預填充速度需 13 分鐘以上，應是單純很慢而非卡住 (log 每約 6.5 分鐘一筆 scheduler 紀錄為正常進度)；自製伺服器處理同一 prompt 約 11 ~ 12 分鐘 (期間有其他請求排隊，僅供參考)。
 
-### 5. HETERO (GPU + CPU 分工) 失敗
+### 5. 自製伺服器支援 (`LLM_MODEL=qwen3.6-35b-a3b`)
+* 語言模型輸入與 27B 相同 (`inputs_embeds` / `attention_mask` / 4 維 `position_ids` / `beam_idx`)，tokenizer 與停止標記也相同，只需選擇模型資料夾並改用 CPU 編譯。
+* 啟動：`run_api_server.bat qwen3.6-35b-a3b` (API 模型名稱 `qwen3.6-35b-a3b-int4-ov`)；`LLM_DEVICE` 可覆寫裝置。
+* **Prefix caching 修正**：Qwen3.6 模板預設 (`preserve_thinking` 未設定) 會刪除歷史回答的 `<think>` 區塊，但這些 token 已送入模型，導致每輪都判定不一致而整段重算 (第 2、3 輪各約 200 秒)。伺服器改為一律傳 `preserve_thinking=True`；27B 模板本來就預設保留，行為不變。
+* 多輪長文 (約 2,500 tokens，後續每輪新增約 33 tokens)：第 1 輪 192 秒，**第 2 / 3 輪 3.1 / 2.9 秒** (沿用 2,511 / 2,548 tokens)，答案 84 / 4550 / 231 全對；工具呼叫 ✅。
+* 已知限制：串流回應不回傳 `usage`；只讀取最上層的 `enable_thinking`，不讀 `chat_template_kwargs`。
+
+### 6. HETERO (GPU + CPU 分工) 失敗
 * `--target_device HETERO:GPU,CPU` 搭配 `MODEL_DISTRIBUTION_POLICY: PIPELINE_PARALLEL`，自動分配仍把過多層放上 GPU，編譯時出現同樣的 `Can not allocate 536870912 bytes for USM Device`。
 * OVMS 無法手動指定各層的裝置，故放棄；即使成功，CPU 與 GPU 共用同一組 DDR4，生成速度仍受頻寬限制，主要只可能改善預填充。
