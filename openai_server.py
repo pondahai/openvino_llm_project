@@ -6,7 +6,7 @@ import uuid
 import asyncio
 import re
 from typing import List, Optional, Dict, Any, Union
-from pydantic import BaseModel, Field, AliasChoices
+from pydantic import BaseModel, Field, AliasChoices, model_validator
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -118,7 +118,16 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[Dict[str, Any]] = None
     stop: Optional[Union[str, List[str]]] = None
     tools: Optional[List[Dict[str, Any]]] = None
-    enable_thinking: Optional[bool] = False
+    # 思考模式：最上層 enable_thinking 優先，其次 chat_template_kwargs.enable_thinking (OVMS / vLLM 慣用)，預設關閉
+    enable_thinking: Optional[bool] = None
+    # 其餘鍵值 (如 reasoning_effort) 直接傳給對話模板
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _resolve_enable_thinking(self):
+        if self.enable_thinking is None:
+            self.enable_thinking = bool((self.chat_template_kwargs or {}).get("enable_thinking", False))
+        return self
 
 def has_tool_context(req: ChatCompletionRequest) -> bool:
     return bool(req.tools or any(m.role == "tool" or m.tool_calls for m in req.messages))
@@ -148,15 +157,17 @@ def render_prompt(req: ChatCompletionRequest, messages: List[ChatMessage]) -> st
             item["tool_calls"] = normalized_tool_calls
         msgs_data.append(item)
         
-    return chat_template.render(
+    template_kwargs = dict(req.chat_template_kwargs or {})
+    template_kwargs.update(
         messages=msgs_data,
         tools=req.tools,
         add_generation_prompt=True,
         enable_thinking=req.enable_thinking,
         # 保留歷史回答的 <think> 區塊，使重新渲染的歷史與已送入模型的 token 一致 (prefix caching 才能沿用)
-        # Qwen3.8 模板預設即保留；Qwen3.6 模板預設會刪除，需明確開啟
+        # Qwen3.8 模板預設即保留；Qwen3.6 模板預設會刪除，需明確開啟 (固定開啟，不接受客戶端覆寫)
         preserve_thinking=True
     )
+    return chat_template.render(**template_kwargs)
 
 def build_input_ids(req: ChatCompletionRequest, max_tokens: int) -> np.ndarray:
     # 以「訊息」為單位從最舊的對話開始丟棄，保留 system 與 tools 定義，
