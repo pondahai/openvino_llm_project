@@ -358,3 +358,15 @@ OVMS 是 Intel 官方的 OpenAI 相容推論伺服器，底層為 OpenVINO GenAI
 ### 6. HETERO (GPU + CPU 分工) 失敗
 * `--target_device HETERO:GPU,CPU` 搭配 `MODEL_DISTRIBUTION_POLICY: PIPELINE_PARALLEL`，自動分配仍把過多層放上 GPU，編譯時出現同樣的 `Can not allocate 536870912 bytes for USM Device`。
 * OVMS 無法手動指定各層的裝置，故放棄；即使成功，CPU 與 GPU 共用同一組 DDR4，生成速度仍受頻寬限制，主要只可能改善預填充。
+
+### 7. 自製伺服器手動分層 (HETERO affinity) 失敗 (OpenVINO 2026.3.1)
+* 做法：`read_model` 後依節點名稱 `layers.N` 決定層號，無名稱節點沿圖往下游 / 上游推算，設定 `rt_info["affinity"]`，前 K 層放 GPU、其餘放 CPU，再以 `HETERO:GPU,CPU` 編譯。已確認分配正確 (K=20 時 GPU 權重 8.45 GB，K=4 時 1.69 GB)。
+
+| 嘗試 | 結果 |
+| :--- | :--- |
+| K=20 | 編譯時 `Can not allocate 536870912 bytes for USM Host` |
+| K=4 | 可載入，但 GPU 共享記憶體峰值 17.3 GB (權重僅 1.69 GB)；首次推論時 `openvino_intel_gpu_plugin.dll` 存取違規 (0xc0000005) 使程式崩潰 |
+| K=4，ReadValue / Assign 改放 CPU | 編譯失敗：`Check 'unregistered_parameters.str().empty()' failed` |
+
+* 推測 GPU plugin 編譯 MoE 層時會展開 int4 專家權重 (約 10 倍)，即使可行也只能放約 6 / 40 層；狀態節點放 GPU 會崩潰、放 CPU 無法編譯。
+* 結論：此模型在本機的最佳方案為自製伺服器全 CPU (約 2,500 tokens 首字延遲 196 秒、多輪後續約 3 秒、生成約 4 tokens/s)。實驗程式碼未保留。
